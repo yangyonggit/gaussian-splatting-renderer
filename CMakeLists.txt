@@ -66,4 +66,10 @@ target_link_libraries(MiniGSRenderer PRIVATE glm::glm)
 # ${stb_SOURCE_DIR} is automatically defined by FetchContent.
 target_include_directories(MiniGSRenderer PRIVATE ${stb_SOURCE_DIR})
 
+
+target_include_directories(MiniGSRenderer
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 message(STATUS "✅ Setup Complete! Ready to build.")
