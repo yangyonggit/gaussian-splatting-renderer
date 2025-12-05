@@ -1,0 +1,37 @@
+# --- Build & Output Directories ---
+build/
+out/
+bin/
+cmake-build-*/
+
+# --- IDE & Editor Settings ---
+.vscode/
+.idea/
+.vs/
+*.sln
+*.vcxproj
+*.user
+.DS_Store
+
+# --- CMake Generated Files ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# --- Compiled Binaries & Libraries ---
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.so
+*.dylib
+*.pdb
+
+# --- Renderer Output Images ---
+*.png
+*.ppm
+*.jpg
