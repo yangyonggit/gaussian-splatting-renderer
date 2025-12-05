@@ -14,6 +14,7 @@
 #include "gs/gaussian.h"
 #include "gs/projection.h"
 #include "gs/screen_splat.h"
+#include "gs/ply_loader.h"
 
 
 const int WIDTH  = 800;
@@ -24,57 +25,80 @@ struct FloatPixel {
     float r, g, b, a;
 };
 
-int main() {
-    std::cout << "🚀 MiniGS Renderer V1-CPU Starting..." << std::endl;
+// ------------------------------------------------------------
+// Helper Functions
+// ------------------------------------------------------------
 
-    // ------------------------------------------------------------
-    // 1. Camera & MVP Test
-    // ------------------------------------------------------------
-    glm::vec3 camPos(0.f, 0.f, 3.f);
-    glm::vec3 target(0.f, 0.f, 0.f);
-    glm::vec3 up(0.f, 1.f, 0.f);
+/**
+ * Parse command line arguments
+ */
+struct CommandLineArgs {
+    std::string inputFile;
+    std::string outputFile;
+    bool showHelp;
+};
 
+CommandLineArgs parseCommandLine(int argc, char* argv[]) {
+    CommandLineArgs args;
+    args.inputFile = "scene.ply";
+    args.outputFile = "output_real_scene.png";
+    args.showHelp = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--scene" && i + 1 < argc) {
+            args.inputFile = argv[++i];
+        }
+        else if (arg == "--output" && i + 1 < argc) {
+            args.outputFile = argv[++i];
+        }
+        else if (arg == "--help" || arg == "-h") {
+            args.showHelp = true;
+        }
+    }
+
+    return args;
+}
+
+/**
+ * Print usage information
+ */
+void printUsage(const char* programName) {
+    std::cout << "Usage: " << programName << " [options]\n";
+    std::cout << "Options:\n";
+    std::cout << "  --scene <file>   Input PLY file (default: scene.ply)\n";
+    std::cout << "  --output <file>  Output PNG file (default: output_real_scene.png)\n";
+    std::cout << "  --help, -h       Show this help message\n";
+}
+
+/**
+ * Build Model-View-Projection matrix from camera parameters
+ */
+glm::mat4 buildMVP(const glm::vec3& camPos, const glm::vec3& target, const glm::vec3& up) {
     glm::mat4 view = glm::lookAt(camPos, target, up);
     glm::mat4 proj = glm::perspective(
         glm::radians(45.0f),
         float(WIDTH) / float(HEIGHT),
         0.1f, 100.0f
     );
+    return proj * view;
+}
 
-    glm::mat4 mvp = proj * view;
-
-    std::cout << "GLM ready. MVP[0][0] = " << mvp[0][0] << std::endl;
-
-    // ------------------------------------------------------------
-    // 2. Create Test Gaussian Splats (only positions for now)
-    // ------------------------------------------------------------
-    std::vector<gs::GaussianSplat> splats;
-    splats.reserve(2000);
-
-    for (int i = 0; i < 2000; i++) {
-        float x = (rand() / float(RAND_MAX) - 0.5f) * 2.0f;
-        float y = (rand() / float(RAND_MAX) - 0.5f) * 2.0f;
-        float z = -3.0f + (rand() / float(RAND_MAX)) * 1.0f;
-
-        splats.push_back({
-            glm::vec3(x, y, z),
-            glm::vec3((x+1)/2.f, (y+1)/2.f, 0.5f),
-            0.05f,
-            0.8f
-        });
-    }
-
-    std::cout << "Created " << splats.size() << " GaussianSplats.\n";
-
-    // ------------------------------------------------------------
-    // 3. Project to ScreenSplat and collect visible splats
-    // ------------------------------------------------------------
+/**
+ * Project 3D Gaussian splats to screen space
+ */
+std::vector<gs::ScreenSplat> projectSplats(
+    const std::vector<gs::GaussianSplat>& splats,
+    const glm::mat4& mvp,
+    int width,
+    int height
+) {
     std::vector<gs::ScreenSplat> projected;
     projected.reserve(splats.size());
 
     for (const auto& s : splats) {
         float sx, sy, depth;
-        if (!gs::math::projectToScreen(s.position, mvp, WIDTH, HEIGHT, sx, sy, depth))
+        if (!gs::math::projectToScreen(s.position, mvp, width, height, sx, sy, depth))
             continue;
 
         gs::ScreenSplat sp;
@@ -85,47 +109,54 @@ int main() {
         projected.push_back(sp);
     }
 
-    std::cout << "Projected " << projected.size() << " visible splats.\n";
+    return projected;
+}
 
-    // ------------------------------------------------------------
-    // 4. Sort by depth (Painter's Algorithm: back-to-front)
-    // ------------------------------------------------------------
+/**
+ * Sort splats by depth (Painter's Algorithm: back-to-front)
+ */
+void sortSplatsByDepth(std::vector<gs::ScreenSplat>& projected) {
     std::sort(projected.begin(), projected.end(),
         [](const gs::ScreenSplat& a, const gs::ScreenSplat& b) {
-            return a.depth > b.depth; // Larger depth = farther away, draw first
+            return a.depth > b.depth;
         });
+}
 
-    std::cout << "Sorted " << projected.size() << " splats by depth.\n";
-
-    // ------------------------------------------------------------
-    // 5. Initialize float framebuffer with background color
-    // ------------------------------------------------------------
-    std::vector<FloatPixel> framebuffer(WIDTH * HEIGHT);
-    
-    // Background color: dark gray (30/255 ≈ 0.1176)
-    const float bgColor = 30.0f / 255.0f;
+/**
+ * Initialize framebuffer with background color
+ */
+std::vector<FloatPixel> initializeFramebuffer(int width, int height, float bgColor) {
+    std::vector<FloatPixel> framebuffer(width * height);
     for (auto& pixel : framebuffer) {
         pixel.r = bgColor;
         pixel.g = bgColor;
         pixel.b = bgColor;
-        pixel.a = 0.0f; // Start with transparent background for blending
+        pixel.a = 0.0f;
     }
+    return framebuffer;
+}
 
-    // ------------------------------------------------------------
-    // 6. Rasterize each Gaussian splat with alpha blending
-    // ------------------------------------------------------------
-    const float R = 6.0f;           // Screen-space radius (pixels)
-    const float sigma = R * 0.5f;
+/**
+ * Rasterize Gaussian splats with alpha blending
+ */
+void rasterizeGaussians(
+    std::vector<FloatPixel>& framebuffer,
+    const std::vector<gs::ScreenSplat>& projected,
+    int width,
+    int height,
+    float radius
+) {
+    const float sigma = radius * 0.5f;
     const float inv2sigma2 = 1.0f / (2.0f * sigma * sigma);
 
     for (const auto& sp : projected) {
         const gs::GaussianSplat& s = *sp.src;
 
         // Calculate bounding box in screen space
-        int x0 = std::max(0,         static_cast<int>(std::floor(sp.sx - R)));
-        int x1 = std::min(WIDTH - 1, static_cast<int>(std::ceil(sp.sx + R)));
-        int y0 = std::max(0,          static_cast<int>(std::floor(sp.sy - R)));
-        int y1 = std::min(HEIGHT - 1, static_cast<int>(std::ceil(sp.sy + R)));
+        int x0 = std::max(0,           static_cast<int>(std::floor(sp.sx - radius)));
+        int x1 = std::min(width - 1,   static_cast<int>(std::ceil(sp.sx + radius)));
+        int y0 = std::max(0,           static_cast<int>(std::floor(sp.sy - radius)));
+        int y1 = std::min(height - 1,  static_cast<int>(std::ceil(sp.sy + radius)));
 
         // Rasterize pixels within the bounding box
         for (int y = y0; y <= y1; ++y) {
@@ -136,7 +167,7 @@ int main() {
                 float dist2 = dx * dx + dy * dy;
 
                 // Skip pixels outside the circular radius
-                if (dist2 > R * R) continue;
+                if (dist2 > radius * radius) continue;
 
                 // Gaussian weight
                 float w = std::exp(-dist2 * inv2sigma2);
@@ -146,7 +177,7 @@ int main() {
                 if (alpha <= 1e-4f) continue;
 
                 // Alpha blending: src over dst
-                int idx = y * WIDTH + x;
+                int idx = y * width + x;
                 FloatPixel& dst = framebuffer[idx];
                 
                 const glm::vec3& srcColor = s.color;
@@ -167,29 +198,91 @@ int main() {
             }
         }
     }
+}
 
-    std::cout << "✔ Gaussian rasterization complete.\n";
-
-    // ------------------------------------------------------------
-    // 7. Convert float framebuffer to byte array for PNG output
-    // ------------------------------------------------------------
-    std::vector<unsigned char> outBytes(WIDTH * HEIGHT * 3);
-    for (int i = 0; i < WIDTH * HEIGHT; ++i) {
+/**
+ * Convert float framebuffer to byte array for PNG output
+ */
+std::vector<unsigned char> convertToBytes(const std::vector<FloatPixel>& framebuffer) {
+    std::vector<unsigned char> outBytes(framebuffer.size() * 3);
+    for (size_t i = 0; i < framebuffer.size(); ++i) {
         const FloatPixel& p = framebuffer[i];
         int idx = i * 3;
         outBytes[idx + 0] = static_cast<unsigned char>(std::clamp(p.r, 0.0f, 1.0f) * 255.0f);
         outBytes[idx + 1] = static_cast<unsigned char>(std::clamp(p.g, 0.0f, 1.0f) * 255.0f);
         outBytes[idx + 2] = static_cast<unsigned char>(std::clamp(p.b, 0.0f, 1.0f) * 255.0f);
     }
+    return outBytes;
+}
+
+// ------------------------------------------------------------
+// Main Function
+// ------------------------------------------------------------
+
+int main(int argc, char* argv[]) {
+    std::cout << "🚀 MiniGS Renderer V1-CPU Starting..." << std::endl;
 
     // ------------------------------------------------------------
-    // 8. Save PNG
+    // 1. Parse command line arguments
     // ------------------------------------------------------------
-    const char* filename = "output_gaussian.png";
-    int ok = stbi_write_png(filename, WIDTH, HEIGHT, 3, outBytes.data(), WIDTH * 3);
+    CommandLineArgs args = parseCommandLine(argc, argv);
+
+    if (args.showHelp) {
+        printUsage(argv[0]);
+        return 0;
+    }
+
+    std::cout << "Input:  " << args.inputFile << std::endl;
+    std::cout << "Output: " << args.outputFile << std::endl;
+
+    // ------------------------------------------------------------
+    // 2. Setup Camera & MVP
+    // ------------------------------------------------------------
+    glm::vec3 camPos(0.f, 0.f, 3.f);
+    glm::vec3 target(0.f, 0.f, 0.f);
+    glm::vec3 up(0.f, 1.f, 0.f);
+
+    glm::mat4 mvp = buildMVP(camPos, target, up);
+    std::cout << "GLM ready. MVP[0][0] = " << mvp[0][0] << std::endl;
+
+    // ------------------------------------------------------------
+    // 3. Load Gaussian Splats from PLY file
+    // ------------------------------------------------------------
+    std::vector<gs::GaussianSplat> splats = gs::loadGaussianPly(args.inputFile);
+    
+    if (splats.empty()) {
+        std::cerr << "Failed to load PLY file or file is empty!" << std::endl;
+        return 1;
+    }
+
+    // ------------------------------------------------------------
+    // 3. Project to screen space & Sort by depth
+    // ------------------------------------------------------------
+    std::vector<gs::ScreenSplat> projected = projectSplats(splats, mvp, WIDTH, HEIGHT);
+    std::cout << "Projected " << projected.size() << " visible splats.\n";
+
+    sortSplatsByDepth(projected);
+    std::cout << "Sorted " << projected.size() << " splats by depth.\n";
+
+    // ------------------------------------------------------------
+    // 4. Rasterize Gaussians
+    // ------------------------------------------------------------
+    const float bgColor = 30.0f / 255.0f;
+    std::vector<FloatPixel> framebuffer = initializeFramebuffer(WIDTH, HEIGHT, bgColor);
+
+    const float radius = 6.0f;
+    rasterizeGaussians(framebuffer, projected, WIDTH, HEIGHT, radius);
+    std::cout << "✔ Gaussian rasterization complete.\n";
+
+    // ------------------------------------------------------------
+    // 5. Save output PNG
+    // ------------------------------------------------------------
+    std::vector<unsigned char> outBytes = convertToBytes(framebuffer);
+    
+    int ok = stbi_write_png(args.outputFile.c_str(), WIDTH, HEIGHT, 3, outBytes.data(), WIDTH * 3);
 
     if (ok)
-        std::cout << "Saved: " << filename << std::endl;
+        std::cout << "Saved: " << args.outputFile << std::endl;
     else
         std::cout << "Failed to save PNG!" << std::endl;
 
