@@ -43,6 +43,16 @@ if(NOT stb_POPULATED)
     FetchContent_Populate(stb)
 endif()
 
+# --- Dependency: nlohmann_json (header-only JSON library) ---
+message(STATUS "⬇️  Fetching nlohmann_json...")
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+
+FetchContent_MakeAvailable(nlohmann_json)
+
 
 # ----------------------------------------------------------
 # 2. Source Code Configuration
@@ -60,6 +70,9 @@ add_executable(MiniGSRenderer ${SOURCES})
 # Link GLM
 # GLM provides a modern CMake target "glm::glm" that handles include paths automatically.
 target_link_libraries(MiniGSRenderer PRIVATE glm::glm)
+
+# Link nlohmann_json (header-only target)
+target_link_libraries(MiniGSRenderer PRIVATE nlohmann_json::nlohmann_json)
 
 # Include STB directory
 # STB is a header-only library without a CMake target, so we manually add the include path.
