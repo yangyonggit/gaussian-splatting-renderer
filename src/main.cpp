@@ -323,7 +323,8 @@ std::vector<FloatPixel> initializeFramebuffer(int width, int height, float bgCol
 }
 
 /**
- * Rasterize Gaussian splats with ellipse-based (Mahalanobis distance) blending
+ * Rasterize Gaussian splats with ellipse-based blending.
+ * Optimized with Premultiplied Alpha to avoid division in the inner loop.
  */
 void rasterizeGaussians(
     std::vector<FloatPixel>& framebuffer,
@@ -332,18 +333,23 @@ void rasterizeGaussians(
     int height,
     const glm::vec3& camera_pos
 ) {
+    // IMPORTANT: Ensure 'projected' is sorted Back-to-Front before calling this function!
+
     for (const auto& sp : projected) {
         const gs::GaussianSplat& s = *sp.src;
 
         // Calculate bounding box in screen space
-        int x0 = std::max(0,           static_cast<int>(std::floor(sp.sx - sp.radius_px)));
-        int x1 = std::min(width - 1,   static_cast<int>(std::ceil(sp.sx + sp.radius_px)));
-        int y0 = std::max(0,           static_cast<int>(std::floor(sp.sy - sp.radius_px)));
-        int y1 = std::min(height - 1,  static_cast<int>(std::ceil(sp.sy + sp.radius_px)));
+        int x0 = std::max(0,          static_cast<int>(std::floor(sp.sx - sp.radius_px)));
+        int x1 = std::min(width - 1,  static_cast<int>(std::ceil(sp.sx + sp.radius_px)));
+        int y0 = std::max(0,          static_cast<int>(std::floor(sp.sy - sp.radius_px)));
+        int y1 = std::min(height - 1, static_cast<int>(std::ceil(sp.sy + sp.radius_px)));
 
         // Evaluate view-dependent color using SH
         glm::vec3 view_dir = glm::normalize(camera_pos - s.position_ws);
         glm::vec3 color = gs::evalSHColor(s, view_dir);
+
+        // Clamp color to ensure valid range before premultiplication
+        color = glm::clamp(color, 0.0f, 1.0f);
 
         // Rasterize pixels within the bounding box
         for (int y = y0; y <= y1; ++y) {
@@ -354,38 +360,44 @@ void rasterizeGaussians(
                     (y + 0.5f) - sp.sy
                 );
 
-                // Mahalanobis distance squared: d^T Σ^{-1} d
+                // Mahalanobis distance squared: d^T * Σ^{-1} * d
                 glm::vec2 tmp = sp.cov_inv * d;
                 float r2 = glm::dot(d, tmp);
 
                 // Elliptical Gaussian weight
                 float w = std::exp(-0.5f * r2);
 
-                // Skip very small weights
+                // Skip very small weights for performance
                 if (w < 1e-4f) continue;
 
-                // Final alpha combining opacity and Gaussian weight
+                // Calculate final alpha
                 float alpha = s.opacity * w;
-                if (alpha <= 1e-6f) continue;
+                
+                // Skip almost transparent pixels
+                if (alpha <= 1.0f / 255.0f) continue; 
 
-                // Alpha blending: src over dst
+                // -----------------------------------------------------------
+                // Premultiplied Alpha Blending Optimization
+                // Formula: Result = Src + Dst * (1 - SrcAlpha)
+                // -----------------------------------------------------------
+                
                 int idx = y * width + x;
                 FloatPixel& dst = framebuffer[idx];
-                
-                float srcA = alpha;
 
-                // Compute blended output
-                float outA = srcA + dst.a * (1.0f - srcA);
-                if (outA < 1e-6f) continue;
+                // 1. Pre-multiply source color (Source RGB * Source Alpha)
+                float src_a = alpha;
+                float src_r = color.r * src_a;
+                float src_g = color.g * src_a;
+                float src_b = color.b * src_a;
 
-                float outR = (color.r * srcA + dst.r * dst.a * (1.0f - srcA)) / outA;
-                float outG = (color.g * srcA + dst.g * dst.a * (1.0f - srcA)) / outA;
-                float outB = (color.b * srcA + dst.b * dst.a * (1.0f - srcA)) / outA;
+                // 2. Calculate the transmission factor
+                float inv_src_a = 1.0f - src_a;
 
-                dst.r = outR;
-                dst.g = outG;
-                dst.b = outB;
-                dst.a = outA;
+                // 3. Accumulate directly (No division needed)
+                dst.r = src_r + dst.r * inv_src_a;
+                dst.g = src_g + dst.g * inv_src_a;
+                dst.b = src_b + dst.b * inv_src_a;
+                dst.a = src_a + dst.a * inv_src_a; 
             }
         }
     }

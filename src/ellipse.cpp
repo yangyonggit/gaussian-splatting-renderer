@@ -133,11 +133,11 @@ bool projectToScreenEllipse(
     //    Use 3 * max axis length (≈ 3σ) and clamp to a reasonable range.
     // ---------------------------------------------------------------------
     float max_len   = std::sqrt(max_len2);
-    float radius_px = max_len * 1.5f; // ~3 sigma
+    float radius_px = max_len * 3.0f; // ~3 sigma
 
     // Clamp radius to a reasonable range
     const float min_radius = 1.0f;
-    const float max_radius = 80.0f;   // tune this if needed
+    const float max_radius = 1024.0f;   // tune this if needed
     radius_px = std::clamp(radius_px, min_radius, max_radius);
 
     // ---------------------------------------------------------------------
