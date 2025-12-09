@@ -1,17 +1,29 @@
 cmake_minimum_required(VERSION 3.14)
 
+# Prevent CMake from using vcpkg toolchain if set
+set(CMAKE_TOOLCHAIN_FILE "" CACHE FILEPATH "CMake toolchain file" FORCE)
+
 # Define the project name and version
-project(MiniGSRenderer VERSION 1.0)
+project(MiniGSRenderer VERSION 1.0 LANGUAGES CXX CUDA)
 
 # Set C++ Standard to C++17 (Required for modern features)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED True)
+
+# Set CUDA architectures (RTX 20/30/40 series)
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+
+# Enable CUDA separable compilation
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 # Enable standard compiler warnings (Good practice)
 if(MSVC)
-    add_compile_options(/W3)
+    # Apply C++ warnings only to C++ files
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W3>)
 else()
-    add_compile_options(-Wall -Wextra)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 endif()
 
 # ----------------------------------------------------------
@@ -57,15 +69,19 @@ FetchContent_MakeAvailable(nlohmann_json)
 # ----------------------------------------------------------
 # 2. Source Code Configuration
 # ----------------------------------------------------------
-# Recursively find all .cpp files in the src/ directory
-file(GLOB_RECURSE SOURCES "src/*.cpp")
+# Recursively find all .cpp and .cu files in the src/ directory
+file(GLOB_RECURSE CPP_SOURCES "src/*.cpp")
+file(GLOB_RECURSE CUDA_SOURCES "src/*.cu")
 
 # Create the executable target
-add_executable(MiniGSRenderer ${SOURCES})
+add_executable(MiniGSRenderer ${CPP_SOURCES} ${CUDA_SOURCES})
 
 # ----------------------------------------------------------
 # 3. Linking & Includes
 # ----------------------------------------------------------
+
+# Find CUDA Toolkit (required for cudaMemcpy, cudaMalloc, etc.)
+find_package(CUDAToolkit REQUIRED)
 
 # Link GLM
 # GLM provides a modern CMake target "glm::glm" that handles include paths automatically.
@@ -73,6 +89,9 @@ target_link_libraries(MiniGSRenderer PRIVATE glm::glm)
 
 # Link nlohmann_json (header-only target)
 target_link_libraries(MiniGSRenderer PRIVATE nlohmann_json::nlohmann_json)
+
+# Link CUDA runtime
+target_link_libraries(MiniGSRenderer PRIVATE CUDA::cudart)
 
 # Include STB directory
 # STB is a header-only library without a CMake target, so we manually add the include path.

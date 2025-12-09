@@ -22,6 +22,7 @@
 #include "gs/sh_color.h"
 #include "gs/camera.h"
 #include "cpu_rasterizer.h"
+#include "cuda_rasterizer.h"
 
 
 const int DEFAULT_WIDTH  = 1959;
@@ -93,7 +94,7 @@ void printUsage(const char* programName) {
 // ------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-    std::cout << "🚀 MiniGS Renderer V3-CPU (Ellipse + SH) Starting..." << std::endl;
+    std::cout << "🚀 MiniGS Renderer V3 (CPU + CUDA) Starting..." << std::endl;
 
     // Parse command line arguments
     CommandLineArgs args = parseCommandLine(argc, argv);
@@ -115,19 +116,27 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Use the CPU rasterizer
-    CpuRasterizer::Rasterizer cpu_rasterizer;
-    if (!cpu_rasterizer.render(
-        args.inputFile,
-        args.outputFile,
-        cam.view,
-        cam.proj,
-        cam.width,
-        cam.height,
-        cam.position
-    )) {
+    // Load Gaussian splats from PLY file
+    std::cout << "\n📂 Loading Gaussian splats from " << args.inputFile << "..." << std::endl;
+    std::vector<gs::GaussianSplat> splats = gs::loadGaussianPly(args.inputFile);
+    if (splats.empty()) {
+        std::cerr << "❌ Failed to load PLY file or file is empty" << std::endl;
         return 1;
     }
+    std::cout << "✅ Loaded " << splats.size() << " Gaussian splats" << std::endl;
+
+    // Initialize CUDA rasterizer and upload data
+    std::cout << "\n🎮 Initializing CUDA rasterizer..." << std::endl;
+    CudaRasterizer::Rasterizer cuda_rasterizer;
+    cuda_rasterizer.loadFromSplats(splats);
+
+    // Test render call (placeholder)
+    cuda_rasterizer.render();
+
+    // Clean up GPU memory
+    cuda_rasterizer.free();
+
+    std::cout << "\n✅ CUDA initialization complete!" << std::endl;
 
     return 0;
 }
