@@ -41,6 +41,7 @@ struct CommandLineArgs {
     bool showHelp;
     std::string cameraConfigFile;
     int camId;
+    bool useCuda;
 };
 
 CommandLineArgs parseCommandLine(int argc, char* argv[]) {
@@ -49,6 +50,7 @@ CommandLineArgs parseCommandLine(int argc, char* argv[]) {
     args.outputFile = "output_real_scene.png";
     args.showHelp = false;
     args.camId = -1;
+    args.useCuda = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -57,6 +59,9 @@ CommandLineArgs parseCommandLine(int argc, char* argv[]) {
         }
         else if (arg == "--output" && i + 1 < argc) {
             args.outputFile = argv[++i];
+        }
+        else if (arg == "--cuda") {
+            args.useCuda = true;
         }
         else if (arg == "--camera_config" && i + 1 < argc) {
             args.cameraConfigFile = argv[++i];
@@ -82,6 +87,7 @@ void printUsage(const char* programName) {
     std::cout << "  --output <file>  Output PNG file (default: output_real_scene.png)\n";
     std::cout << "  --camera_config <file> JSON camera list (array of cameras)\n";
     std::cout << "  --cam_id <id>    Camera id to pick from the JSON\n";
+    std::cout << "  --cuda           Use CUDA rasterizer (default: CPU)\n";
     std::cout << "  --help, -h       Show this help message\n";
 }
 
@@ -106,6 +112,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Input:  " << args.inputFile << std::endl;
     std::cout << "Output: " << args.outputFile << std::endl;
+    std::cout << "Mode:   " << (args.useCuda ? "CUDA" : "CPU") << std::endl;
     if (!args.cameraConfigFile.empty()) {
         std::cout << "Camera config: " << args.cameraConfigFile << " (id=" << args.camId << ")" << std::endl;
     }
@@ -116,27 +123,85 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Load Gaussian splats from PLY file
-    std::cout << "\n📂 Loading Gaussian splats from " << args.inputFile << "..." << std::endl;
-    std::vector<gs::GaussianSplat> splats = gs::loadGaussianPly(args.inputFile);
-    if (splats.empty()) {
-        std::cerr << "❌ Failed to load PLY file or file is empty" << std::endl;
-        return 1;
+    // Choose rendering path
+    if (args.useCuda) {
+        // CUDA V1 Rendering Path
+        std::cout << "\n🎮 CUDA V1 Rendering Path" << std::endl;
+        std::cout << "========================================" << std::endl;
+
+        // CPU Preprocessing: project and sort
+        CpuRasterizer::Rasterizer cpu_prep;
+        std::vector<gs::GaussianSplat> splats;  // Keep splats alive!
+        std::vector<gs::ScreenSplat> screen_splats;
+        std::vector<int> sorted_indices;
+
+        if (!cpu_prep.prepareForCuda(
+            args.inputFile,
+            cam.view,
+            cam.proj,
+            cam.width,
+            cam.height,
+            splats,
+            screen_splats,
+            sorted_indices
+        )) {
+            std::cerr << "❌ CPU preprocessing failed" << std::endl;
+            return 1;
+        }
+
+        // CUDA Rendering
+        CudaRasterizer::Rasterizer cuda_rasterizer;
+        std::vector<float> output_image(cam.width * cam.height * 3);
+
+        if (!cuda_rasterizer.render_cuda(
+            screen_splats,
+            sorted_indices,
+            cam.position,
+            cam.width,
+            cam.height,
+            output_image.data()
+        )) {
+            std::cerr << "❌ CUDA rendering failed" << std::endl;
+            return 1;
+        }
+
+        // Save output
+        std::vector<unsigned char> output_bytes(cam.width * cam.height * 3);
+        for (size_t i = 0; i < output_image.size(); ++i) {
+            output_bytes[i] = static_cast<unsigned char>(
+                std::clamp(output_image[i], 0.0f, 1.0f) * 255.0f
+            );
+        }
+
+        if (!stbi_write_png(args.outputFile.c_str(), cam.width, cam.height, 3,
+                           output_bytes.data(), cam.width * 3)) {
+            std::cerr << "❌ Failed to save PNG" << std::endl;
+            return 1;
+        }
+
+        std::cout << "✅ Saved: " << args.outputFile << std::endl;
+
+    } else {
+        // CPU Rendering Path
+        std::cout << "\n💻 CPU Rendering Path" << std::endl;
+        std::cout << "========================================" << std::endl;
+
+        CpuRasterizer::Rasterizer cpu_rasterizer;
+        if (!cpu_rasterizer.render(
+            args.inputFile,
+            args.outputFile,
+            cam.view,
+            cam.proj,
+            cam.width,
+            cam.height,
+            cam.position
+        )) {
+            std::cerr << "❌ CPU rendering failed" << std::endl;
+            return 1;
+        }
     }
-    std::cout << "✅ Loaded " << splats.size() << " Gaussian splats" << std::endl;
 
-    // Initialize CUDA rasterizer and upload data
-    std::cout << "\n🎮 Initializing CUDA rasterizer..." << std::endl;
-    CudaRasterizer::Rasterizer cuda_rasterizer;
-    cuda_rasterizer.loadFromSplats(splats);
-
-    // Test render call (placeholder)
-    cuda_rasterizer.render();
-
-    // Clean up GPU memory
-    cuda_rasterizer.free();
-
-    std::cout << "\n✅ CUDA initialization complete!" << std::endl;
+    std::cout << "\n🎉 Rendering complete!" << std::endl;
 
     return 0;
 }

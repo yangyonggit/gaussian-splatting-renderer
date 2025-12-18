@@ -38,6 +38,31 @@ public:
         const glm::vec3& camera_pos
     );
 
+    /**
+     * Prepare screen-space splats for CUDA rendering.
+     * Projects gaussians, computes 2D conics, and sorts by depth.
+     * This is the CPU preprocessing step for CUDA V1 rendering.
+     * 
+     * @param ply_path Path to input PLY file
+     * @param view View matrix
+     * @param proj Projection matrix
+     * @param width Image width
+     * @param height Image height
+     * @param out_screen_splats Output: projected screen-space splats
+     * @param out_sorted_indices Output: back-to-front sorted indices
+     * @return true on success
+     */
+    bool prepareForCuda(
+        const std::string& ply_path,
+        const glm::mat4& view,
+        const glm::mat4& proj,
+        int width,
+        int height,
+        std::vector<gs::GaussianSplat>& out_splats,
+        std::vector<gs::ScreenSplat>& out_screen_splats,
+        std::vector<int>& out_sorted_indices
+    );
+
 private:
     // Internal helper structures
     struct FloatPixel {

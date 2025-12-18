@@ -220,4 +220,47 @@ bool Rasterizer::saveFramebuffer(
     }
 }
 
+bool Rasterizer::prepareForCuda(
+    const std::string& ply_path,
+    const glm::mat4& view,
+    const glm::mat4& proj,
+    int width,
+    int height,
+    std::vector<gs::GaussianSplat>& out_splats,
+    std::vector<gs::ScreenSplat>& out_screen_splats,
+    std::vector<int>& out_sorted_indices
+) {
+    std::cout << "🔄 CPU Preprocessing for CUDA V1..." << std::endl;
+
+    // Load Gaussian Splats from PLY
+    out_splats = gs::loadGaussianPly(ply_path);
+    std::vector<gs::GaussianSplat>& splats = out_splats;
+    
+    if (splats.empty()) {
+        std::cerr << "Failed to load PLY file or file is empty!" << std::endl;
+        return false;
+    }
+
+    std::cout << "Loaded " << splats.size() << " Gaussian splats." << std::endl;
+
+    // Project to screen space
+    if (!projectSplats(splats, view, proj, width, height, out_screen_splats)) {
+        return false;
+    }
+
+    // Sort by depth (back-to-front)
+    sortByDepth(out_screen_splats);
+
+    // Generate sorted indices array
+    out_sorted_indices.resize(out_screen_splats.size());
+    for (size_t i = 0; i < out_screen_splats.size(); ++i) {
+        out_sorted_indices[i] = static_cast<int>(i);
+    }
+
+    std::cout << "✅ CPU preprocessing complete: " 
+              << out_screen_splats.size() << " splats ready for CUDA" << std::endl;
+
+    return true;
+}
+
 } // namespace CpuRasterizer

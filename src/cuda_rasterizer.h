@@ -1,17 +1,27 @@
 #pragma once
 
+#include <glm/glm.hpp>
 #include <vector>
 
 // Forward declaration to avoid including gaussian.h in header
 namespace gs {
     struct GaussianSplat;
+    struct ScreenSplat;
 }
 
 namespace CudaRasterizer {
 
 /**
- * CUDA-based Gaussian Splatting Rasterizer
- * Manages GPU memory and data transfer for Gaussian splats
+ * CUDA V1: Minimal Baseline Rasterizer for Gaussian Splatting
+ * 
+ * Design Philosophy:
+ * - NO tiling / binning
+ * - NO shared memory optimizations
+ * - Sorting done on CPU (back-to-front order)
+ * - GPU only does per-pixel splatting with alpha blending
+ * - Simple, correct, and easy to debug
+ * 
+ * Performance: O(W*H*N) - acceptable for debugging and small scenes
  */
 class Rasterizer {
 public:
@@ -19,42 +29,27 @@ public:
     ~Rasterizer();
 
     /**
-     * Allocate GPU memory for the specified number of Gaussian splats
-     * @param num_points Number of Gaussian splats to allocate memory for
+     * V1 Render Function - Minimal CUDA Gaussian Splatting
+     * 
+     * Takes CPU-preprocessed screen-space data and renders to output image.
+     * All projection and sorting is done on CPU before calling this function.
+     * 
+     * @param screen_splats Screen-space splats with 2D positions, conic matrices, colors
+     * @param sorted_indices Back-to-front sorted indices (far -> near)
+     * @param camera_pos Camera position for SH color evaluation
+     * @param width Output image width
+     * @param height Output image height
+     * @param output_image RGB output buffer [W*H*3], allocated by caller
+     * @return true on success, false on error
      */
-    void allocate(int num_points);
-
-    /**
-     * Upload Gaussian splat data to GPU
-     * @param positions Flat array of 3D positions (size: num_points * 3)
-     * @param scales Flat array of 3D scales (size: num_points * 3)
-     * @param rotations Flat array of quaternions (size: num_points * 4)
-     * @param opacities Array of opacity values (size: num_points)
-     * @param sh_coeffs Flat array of SH coefficients (size: num_points * sh_dim)
-     * @param num_points Number of Gaussian splats
-     * @param sh_dim Number of SH coefficients per point (typically 48 for degree 3)
-     */
-    void uploadData(
-        const float* positions,
-        const float* scales,
-        const float* rotations,
-        const float* opacities,
-        const float* sh_coeffs,
-        int num_points,
-        int sh_dim
+    bool render_cuda(
+        const std::vector<gs::ScreenSplat>& screen_splats,
+        const std::vector<int>& sorted_indices,
+        const glm::vec3& camera_pos,
+        int width,
+        int height,
+        float* output_image
     );
-
-    /**
-     * Load and upload Gaussian splats from vector (high-level interface)
-     * Automatically handles SoA conversion and GPU upload
-     * @param splats Vector of GaussianSplat structures
-     */
-    void loadFromSplats(const std::vector<gs::GaussianSplat>& splats);
-
-    /**
-     * Render the Gaussian splats (placeholder for future implementation)
-     */
-    void render();
 
     /**
      * Free all GPU memory
@@ -62,15 +57,20 @@ public:
     void free();
 
 private:
-    int num_points_;
-    int sh_dim_;
+    // Device memory pointers (allocated dynamically per render call)
+    float* d_means2D_;      // Screen positions [N*2]: (sx, sy)
+    float* d_conic3D_;      // 2D conic matrices [N*3]: (a, b, c) where conic = [a b; b c]
+    float* d_colors_;       // RGB colors [N*3]
+    float* d_opacities_;    // Opacity values [N]
+    int* d_sorted_indices_; // Sorted indices [N]
+    float* d_output_;       // Output image [W*H*3]
 
-    // GPU memory pointers
-    float* d_pos_;      // 3D positions (num_points * 3)
-    float* d_scale_;    // 3D scales (num_points * 3)
-    float* d_rot_;      // Quaternions (num_points * 4)
-    float* d_opacity_;  // Opacities (num_points)
-    float* d_sh_;       // SH coefficients (num_points * sh_dim)
+    int num_splats_;
+    int width_, height_;
+
+    // Internal memory management
+    bool allocateBuffers(int num_splats, int width, int height);
+    void freeBuffers();
 };
 
 } // namespace CudaRasterizer
