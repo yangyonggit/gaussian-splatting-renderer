@@ -61,6 +61,27 @@ public:
         std::vector<gs::ScreenSplat>& out_screen_splats
     );
 
+    /**
+     * Reproject already-loaded gaussians with a new view/projection matrix.
+     * Call this each frame when camera changes, to update screen_splats.
+     * 
+     * @param splats Already-loaded gaussians (from prepareForCuda)
+     * @param view New view matrix
+     * @param proj New projection matrix
+     * @param width Image width
+     * @param height Image height
+     * @param out_screen_splats Output: updated screen-space splats
+     * @return true on success
+     */
+    bool reprojectSplats(
+        const std::vector<gs::GaussianSplat>& splats,
+        const glm::mat4& view,
+        const glm::mat4& proj,
+        int width,
+        int height,
+        std::vector<gs::ScreenSplat>& out_screen_splats
+    );
+
 private:
     // Internal helper structures
     struct FloatPixel {

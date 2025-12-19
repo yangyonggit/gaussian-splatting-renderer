@@ -93,6 +93,7 @@ static gs::FpsCamera* g_camera = nullptr;
 static double g_last_mouse_x = 0.0;
 static double g_last_mouse_y = 0.0;
 static bool g_mouse_first_move = true;
+static bool g_mouse_left_pressed = false;  // Track left mouse button state
 
 // Keyboard state
 static bool g_key_w = false;
@@ -146,8 +147,15 @@ static void glfwMouseCallback(GLFWwindow* window, double xpos, double ypos) {
     g_last_mouse_x = xpos;
     g_last_mouse_y = ypos;
 
-    if (g_camera) {
+    // Only rotate camera when left mouse button is pressed
+    if (g_camera && g_mouse_left_pressed) {
         g_camera->processMouse(static_cast<float>(dx), static_cast<float>(dy));
+    }
+}
+
+static void glfwMouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        g_mouse_left_pressed = (action == GLFW_PRESS);
     }
 }
 
@@ -227,6 +235,7 @@ int main(int argc, char* argv[]) {
     // ---- Setup Callbacks ----
     glfwSetKeyCallback(window, glfwKeyCallback);
     glfwSetCursorPosCallback(window, glfwMouseCallback);
+    glfwSetMouseButtonCallback(window, glfwMouseButtonCallback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
     // ---- Create Camera ----
@@ -359,6 +368,20 @@ int main(int argc, char* argv[]) {
             delta_time,
             g_key_shift
         );
+
+        // ---- Reproject Splats with Updated Camera ----
+        {
+            // Compute new view/proj from FPS camera
+            glm::mat4 view = camera.getViewMatrix();
+            float aspect = static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT);
+            glm::mat4 proj = camera.getProjMatrix(aspect);
+
+            // Reproject scene with new camera pose
+            if (!cpu_prep.reprojectSplats(splats, view, proj, WINDOW_WIDTH, WINDOW_HEIGHT, screen_splats)) {
+                std::cerr << "Failed to reproject splats" << std::endl;
+                break;
+            }
+        }
 
         // ---- Render Frame (CUDA) ----
         {

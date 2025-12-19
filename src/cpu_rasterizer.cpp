@@ -304,4 +304,26 @@ bool Rasterizer::prepareForCuda(
     return true;
 }
 
+bool Rasterizer::reprojectSplats(
+    const std::vector<gs::GaussianSplat>& splats,
+    const glm::mat4& view,
+    const glm::mat4& proj,
+    int width,
+    int height,
+    std::vector<gs::ScreenSplat>& out_screen_splats
+) {
+    // Clear previous frame's splats before reprojecting
+    out_screen_splats.clear();
+    
+    // Reproject with new view/proj matrices
+    if (!projectSplats(splats, view, proj, width, height, out_screen_splats)) {
+        return false;
+    }
+
+    // Re-sort by depth
+    sortByDepth(out_screen_splats);
+
+    return true;
+}
+
 } // namespace CpuRasterizer
