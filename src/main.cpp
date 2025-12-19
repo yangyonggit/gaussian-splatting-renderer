@@ -21,6 +21,7 @@
 #include "gs/ellipse.h"
 #include "gs/sh_color.h"
 #include "gs/camera.h"
+#include "gs/profiler.h"
 #include "cpu_rasterizer.h"
 #include "cuda_rasterizer.h"
 
@@ -170,8 +171,15 @@ int main(int argc, char* argv[]) {
             );
         }
 
-        if (!stbi_write_png(args.outputFile.c_str(), cam.width, cam.height, 3,
-                           output_bytes.data(), cam.width * 3)) {
+        double png_ms = 0.0;
+        int ok = 0;
+        {
+            ScopedTimer timer("write_png", &png_ms);
+            ok = stbi_write_png(args.outputFile.c_str(), cam.width, cam.height, 3,
+                               output_bytes.data(), cam.width * 3);
+        }
+
+        if (!ok) {
             std::cerr << "❌ Failed to save PNG" << std::endl;
             return 1;
         }
