@@ -144,6 +144,7 @@ bool projectToScreenEllipse(
     // 6. Fill ScreenSplat
     // ---------------------------------------------------------------------
     out.src      = &g;
+    out.gaussian_id = -1; // Caller assigns actual id after projection
     out.sx       = center_px.x;
     out.sy       = center_px.y;
     // Map NDC z (-1..1) to [0,1] for sorting

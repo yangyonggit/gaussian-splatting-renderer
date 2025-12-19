@@ -49,7 +49,6 @@ public:
      * @param width Image width
      * @param height Image height
      * @param out_screen_splats Output: projected screen-space splats
-     * @param out_sorted_indices Output: back-to-front sorted indices
      * @return true on success
      */
     bool prepareForCuda(
@@ -59,8 +58,7 @@ public:
         int width,
         int height,
         std::vector<gs::GaussianSplat>& out_splats,
-        std::vector<gs::ScreenSplat>& out_screen_splats,
-        std::vector<int>& out_sorted_indices
+        std::vector<gs::ScreenSplat>& out_screen_splats
     );
 
 private:

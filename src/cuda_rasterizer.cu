@@ -147,7 +147,6 @@ Rasterizer::Rasterizer()
     , d_conic3D_(nullptr)
     , d_colors_(nullptr)
     , d_opacities_(nullptr)
-    , d_sorted_indices_(nullptr)
     , d_output_(nullptr)
     , num_splats_(0)
     , width_(0)
@@ -171,7 +170,6 @@ bool Rasterizer::allocateBuffers(int num_splats, int width, int height) {
     CUDA_CHECK(cudaMalloc(&d_conic3D_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_colors_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_opacities_, num_splats * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sorted_indices_, num_splats * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_output_, width * height * 3 * sizeof(float)));
 
     printf("✅ Allocated CUDA buffers: %d splats, %dx%d image\n", num_splats, width, height);
@@ -183,7 +181,6 @@ void Rasterizer::freeBuffers() {
     if (d_conic3D_) { cudaFree(d_conic3D_); d_conic3D_ = nullptr; }
     if (d_colors_) { cudaFree(d_colors_); d_colors_ = nullptr; }
     if (d_opacities_) { cudaFree(d_opacities_); d_opacities_ = nullptr; }
-    if (d_sorted_indices_) { cudaFree(d_sorted_indices_); d_sorted_indices_ = nullptr; }
     if (d_output_) { cudaFree(d_output_); d_output_ = nullptr; }
 }
 
@@ -193,7 +190,6 @@ void Rasterizer::free() {
 
 bool Rasterizer::render_cuda(
     const std::vector<gs::ScreenSplat>& screen_splats,
-    const std::vector<int>& sorted_indices,
     const glm::vec3& camera_pos,
     int width,
     int height,
@@ -203,12 +199,6 @@ bool Rasterizer::render_cuda(
     
     if (num_splats == 0) {
         fprintf(stderr, "Error: No splats to render!\n");
-        return false;
-    }
-
-    if (num_splats != static_cast<int>(sorted_indices.size())) {
-        fprintf(stderr, "Error: Mismatch between splats (%d) and indices (%zu)\n",
-                num_splats, sorted_indices.size());
         return false;
     }
 
@@ -276,8 +266,7 @@ bool Rasterizer::render_cuda(
     std::vector<std::vector<int>> tile_splat_lists(num_tiles);
 
     // For each sorted splat, determine which tiles it affects
-    for (int sorted_idx = 0; sorted_idx < num_splats; ++sorted_idx) {
-        int idx = sorted_indices[sorted_idx];
+    for (int idx = 0; idx < num_splats; ++idx) {
         const gs::ScreenSplat& sp = screen_splats[idx];
 
         // Compute bounding box in tile coordinates
@@ -291,7 +280,7 @@ bool Rasterizer::render_cuda(
         for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
             for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
                 int tile_id = ty * num_tiles_x + tx;
-                tile_splat_lists[tile_id].push_back(sorted_idx);
+                tile_splat_lists[tile_id].push_back(idx);
             }
         }
     }

@@ -91,12 +91,15 @@ bool Rasterizer::projectSplats(
 ) {
     out_projected.reserve(splats.size());
 
-    for (const auto& s : splats) {
+    for (size_t i = 0; i < splats.size(); ++i) {
+        const auto& s = splats[i];
         gs::ScreenSplat sp;
         
         // Use ellipse projection instead of simple point projection
         if (!gs::projectToScreenEllipse(s, view, proj, width, height, sp))
             continue;
+
+        sp.gaussian_id = static_cast<int>(i);
 
         out_projected.push_back(sp);
     }
@@ -227,8 +230,7 @@ bool Rasterizer::prepareForCuda(
     int width,
     int height,
     std::vector<gs::GaussianSplat>& out_splats,
-    std::vector<gs::ScreenSplat>& out_screen_splats,
-    std::vector<int>& out_sorted_indices
+    std::vector<gs::ScreenSplat>& out_screen_splats
 ) {
     std::cout << "🔄 CPU Preprocessing for CUDA V1..." << std::endl;
 
@@ -250,12 +252,6 @@ bool Rasterizer::prepareForCuda(
 
     // Sort by depth (back-to-front)
     sortByDepth(out_screen_splats);
-
-    // Generate sorted indices array
-    out_sorted_indices.resize(out_screen_splats.size());
-    for (size_t i = 0; i < out_screen_splats.size(); ++i) {
-        out_sorted_indices[i] = static_cast<int>(i);
-    }
 
     std::cout << "✅ CPU preprocessing complete: " 
               << out_screen_splats.size() << " splats ready for CUDA" << std::endl;

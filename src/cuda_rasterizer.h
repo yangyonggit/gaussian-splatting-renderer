@@ -35,7 +35,6 @@ public:
      * All projection and sorting is done on CPU before calling this function.
      * 
      * @param screen_splats Screen-space splats with 2D positions, conic matrices, colors
-     * @param sorted_indices Back-to-front sorted indices (far -> near)
      * @param camera_pos Camera position for SH color evaluation
      * @param width Output image width
      * @param height Output image height
@@ -44,7 +43,6 @@ public:
      */
     bool render_cuda(
         const std::vector<gs::ScreenSplat>& screen_splats,
-        const std::vector<int>& sorted_indices,
         const glm::vec3& camera_pos,
         int width,
         int height,
@@ -62,7 +60,6 @@ private:
     float* d_conic3D_;      // 2D conic matrices [N*3]: (a, b, c) where conic = [a b; b c]
     float* d_colors_;       // RGB colors [N*3]
     float* d_opacities_;    // Opacity values [N]
-    int* d_sorted_indices_; // Sorted indices [N]
     float* d_output_;       // Output image [W*H*3]
 
     int num_splats_;

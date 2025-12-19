@@ -133,7 +133,6 @@ int main(int argc, char* argv[]) {
         CpuRasterizer::Rasterizer cpu_prep;
         std::vector<gs::GaussianSplat> splats;  // Keep splats alive!
         std::vector<gs::ScreenSplat> screen_splats;
-        std::vector<int> sorted_indices;
 
         if (!cpu_prep.prepareForCuda(
             args.inputFile,
@@ -142,8 +141,7 @@ int main(int argc, char* argv[]) {
             cam.width,
             cam.height,
             splats,
-            screen_splats,
-            sorted_indices
+            screen_splats
         )) {
             std::cerr << "❌ CPU preprocessing failed" << std::endl;
             return 1;
@@ -155,7 +153,6 @@ int main(int argc, char* argv[]) {
 
         if (!cuda_rasterizer.render_cuda(
             screen_splats,
-            sorted_indices,
             cam.position,
             cam.width,
             cam.height,

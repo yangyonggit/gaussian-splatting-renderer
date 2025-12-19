@@ -6,6 +6,7 @@ namespace gs {
 
 struct ScreenSplat {
     const GaussianSplat* src;   // Pointer to original splat data
+    int gaussian_id;            // Stable index of the source Gaussian
     
     float sx;                   // Screen x coordinate in pixels (float)
     float sy;                   // Screen y coordinate in pixels (float)
