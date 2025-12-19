@@ -254,7 +254,7 @@ bool Rasterizer::render_cuda(
     printf("✅ SH evaluation complete\n");
     fflush(stdout);
 
-    // Build tile splat lists on CPU
+    // Build tile splat lists on CPU (linear layout)
     printf("🔨 Building tile splat lists...\n");
     fflush(stdout);
 
@@ -262,50 +262,64 @@ bool Rasterizer::render_cuda(
     int num_tiles_y = (height + 15) / 16;
     int num_tiles = num_tiles_x * num_tiles_y;
 
-    // Temporary: tile splat lists (may be sparse)
-    std::vector<std::vector<int>> tile_splat_lists(num_tiles);
+    std::vector<int> tile_counts(num_tiles, 0);
 
-    // For each sorted splat, determine which tiles it affects
+    // First pass: count how many splats touch each tile
     for (int idx = 0; idx < num_splats; ++idx) {
         const gs::ScreenSplat& sp = screen_splats[idx];
 
-        // Compute bounding box in tile coordinates
         float radius = sp.radius_px;
         int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
         int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
         int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
         int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
 
-        // Add this splat to all affected tiles
         for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
             for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
                 int tile_id = ty * num_tiles_x + tx;
-                tile_splat_lists[tile_id].push_back(idx);
+                ++tile_counts[tile_id];
             }
         }
     }
 
-    // Flatten tile splat lists and create offsets
-    std::vector<int> h_tile_splat_list;
+    // Prefix sum: compute tile offsets (exclusive)
     std::vector<int> h_tile_offsets(num_tiles + 1, 0);
-
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-        h_tile_offsets[tile_id] = h_tile_splat_list.size();
-        for (int idx : tile_splat_lists[tile_id]) {
-            h_tile_splat_list.push_back(idx);
+        h_tile_offsets[tile_id + 1] = h_tile_offsets[tile_id] + tile_counts[tile_id];
+    }
+
+    // Allocate flat index buffer and per-tile cursor for filling
+    std::vector<int> h_tile_splat_indices(h_tile_offsets[num_tiles], 0);
+    std::vector<int> tile_cursor(num_tiles, 0);
+
+    // Second pass: fill indices in the same sorted order
+    for (int idx = 0; idx < num_splats; ++idx) {
+        const gs::ScreenSplat& sp = screen_splats[idx];
+
+        float radius = sp.radius_px;
+        int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
+        int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
+        int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
+        int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
+
+        for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
+            for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
+                int tile_id = ty * num_tiles_x + tx;
+                int write_idx = h_tile_offsets[tile_id] + tile_cursor[tile_id]++;
+                h_tile_splat_indices[write_idx] = idx;
+            }
         }
     }
-    h_tile_offsets[num_tiles] = h_tile_splat_list.size();
 
     printf("✅ Built tile lists: %zu total splat references across %d tiles\n",
-           h_tile_splat_list.size(), num_tiles);
+           h_tile_splat_indices.size(), num_tiles);
     fflush(stdout);
 
     // Allocate device memory for tile lists
     int* d_tile_splat_list = nullptr;
     int* d_tile_offsets = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_tile_splat_list, h_tile_splat_list.size() * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tile_splat_list, h_tile_splat_indices.size() * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_tile_offsets, (num_tiles + 1) * sizeof(int)));
 
     // Upload data to GPU
@@ -320,8 +334,8 @@ bool Rasterizer::render_cuda(
                          num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), 
                          num_splats * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_list.data(),
-                         h_tile_splat_list.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(),
+                         h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(),
                          (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
