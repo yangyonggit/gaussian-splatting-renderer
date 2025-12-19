@@ -2,6 +2,7 @@
 #include "gs/gaussian.h"
 #include "gs/screen_splat.h"
 #include "gs/sh_color.h"
+#include "gs/profiler.h"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
@@ -204,6 +205,12 @@ bool Rasterizer::render_cuda(
 
     printf("🚀 CUDA V2 Tile-based Render: %d splats, %dx%d image\n", num_splats, width, height);
 
+    double t_sh_ms = 0.0;
+    double t_tile_ms = 0.0;
+    double t_h2d_ms = 0.0;
+    double t_d2h_ms = 0.0;
+    float gpu_total_ms = 0.0f;
+
     // Allocate device buffers
     if (!allocateBuffers(num_splats, width, height)) {
         fprintf(stderr, "❌ Failed to allocate CUDA buffers\n");
@@ -219,36 +226,39 @@ bool Rasterizer::render_cuda(
     std::vector<float> h_colors(num_splats * 3);
     std::vector<float> h_opacities(num_splats);
 
-    for (int i = 0; i < num_splats; ++i) {
-        if (i % 100000 == 0) {
-            printf("  Progress: %d / %d splats (%.1f%%)...\n", i, num_splats, 100.0f * i / num_splats);
-            fflush(stdout);
+    {
+        ScopedTimer timer("sh_eval_and_pack", &t_sh_ms);
+        for (int i = 0; i < num_splats; ++i) {
+            if (i % 100000 == 0) {
+                printf("  Progress: %d / %d splats (%.1f%%)...\n", i, num_splats, 100.0f * i / num_splats);
+                fflush(stdout);
+            }
+            
+            const gs::ScreenSplat& sp = screen_splats[i];
+            
+            if (!sp.src) {
+                fprintf(stderr, "Error: Null source pointer at splat %d\n", i);
+                return false;
+            }
+            
+            h_means2D[i * 2 + 0] = sp.sx;
+            h_means2D[i * 2 + 1] = sp.sy;
+            
+            h_conic3D[i * 3 + 0] = sp.cov_inv[0][0];
+            h_conic3D[i * 3 + 1] = sp.cov_inv[0][1];
+            h_conic3D[i * 3 + 2] = sp.cov_inv[1][1];
+            
+            const gs::GaussianSplat& src = *sp.src;
+            glm::vec3 view_dir = glm::normalize(camera_pos - src.position_ws);
+            glm::vec3 color = gs::evalSHColor(src, view_dir);
+            color = glm::clamp(color, 0.0f, 1.0f);
+            
+            h_colors[i * 3 + 0] = color.r;
+            h_colors[i * 3 + 1] = color.g;
+            h_colors[i * 3 + 2] = color.b;
+            
+            h_opacities[i] = src.opacity;
         }
-        
-        const gs::ScreenSplat& sp = screen_splats[i];
-        
-        if (!sp.src) {
-            fprintf(stderr, "Error: Null source pointer at splat %d\n", i);
-            return false;
-        }
-        
-        h_means2D[i * 2 + 0] = sp.sx;
-        h_means2D[i * 2 + 1] = sp.sy;
-        
-        h_conic3D[i * 3 + 0] = sp.cov_inv[0][0];
-        h_conic3D[i * 3 + 1] = sp.cov_inv[0][1];
-        h_conic3D[i * 3 + 2] = sp.cov_inv[1][1];
-        
-        const gs::GaussianSplat& src = *sp.src;
-        glm::vec3 view_dir = glm::normalize(camera_pos - src.position_ws);
-        glm::vec3 color = gs::evalSHColor(src, view_dir);
-        color = glm::clamp(color, 0.0f, 1.0f);
-        
-        h_colors[i * 3 + 0] = color.r;
-        h_colors[i * 3 + 1] = color.g;
-        h_colors[i * 3 + 2] = color.b;
-        
-        h_opacities[i] = src.opacity;
     }
 
     printf("✅ SH evaluation complete\n");
@@ -262,53 +272,63 @@ bool Rasterizer::render_cuda(
     int num_tiles_y = (height + 15) / 16;
     int num_tiles = num_tiles_x * num_tiles_y;
 
-    std::vector<int> tile_counts(num_tiles, 0);
+    std::vector<int> h_tile_splat_indices;
+    std::vector<int> h_tile_offsets;
+    size_t total_tile_refs = 0;
 
-    // First pass: count how many splats touch each tile
-    for (int idx = 0; idx < num_splats; ++idx) {
-        const gs::ScreenSplat& sp = screen_splats[idx];
+    {
+        ScopedTimer timer("tile_list_build", &t_tile_ms);
 
-        float radius = sp.radius_px;
-        int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
-        int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
-        int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
-        int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
+        std::vector<int> tile_counts(num_tiles, 0);
 
-        for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
-            for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
-                int tile_id = ty * num_tiles_x + tx;
-                ++tile_counts[tile_id];
+        // First pass: count how many splats touch each tile
+        for (int idx = 0; idx < num_splats; ++idx) {
+            const gs::ScreenSplat& sp = screen_splats[idx];
+
+            float radius = sp.radius_px;
+            int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
+            int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
+            int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
+            int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
+
+            for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
+                for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
+                    int tile_id = ty * num_tiles_x + tx;
+                    ++tile_counts[tile_id];
+                }
             }
         }
-    }
 
-    // Prefix sum: compute tile offsets (exclusive)
-    std::vector<int> h_tile_offsets(num_tiles + 1, 0);
-    for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-        h_tile_offsets[tile_id + 1] = h_tile_offsets[tile_id] + tile_counts[tile_id];
-    }
+        // Prefix sum: compute tile offsets (exclusive)
+        h_tile_offsets.assign(num_tiles + 1, 0);
+        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+            h_tile_offsets[tile_id + 1] = h_tile_offsets[tile_id] + tile_counts[tile_id];
+        }
 
-    // Allocate flat index buffer and per-tile cursor for filling
-    std::vector<int> h_tile_splat_indices(h_tile_offsets[num_tiles], 0);
-    std::vector<int> tile_cursor(num_tiles, 0);
+        // Allocate flat index buffer and per-tile cursor for filling
+        h_tile_splat_indices.assign(h_tile_offsets[num_tiles], 0);
+        std::vector<int> tile_cursor(num_tiles, 0);
 
-    // Second pass: fill indices in the same sorted order
-    for (int idx = 0; idx < num_splats; ++idx) {
-        const gs::ScreenSplat& sp = screen_splats[idx];
+        // Second pass: fill indices in the same sorted order
+        for (int idx = 0; idx < num_splats; ++idx) {
+            const gs::ScreenSplat& sp = screen_splats[idx];
 
-        float radius = sp.radius_px;
-        int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
-        int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
-        int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
-        int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
+            float radius = sp.radius_px;
+            int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
+            int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
+            int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
+            int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
 
-        for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
-            for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
-                int tile_id = ty * num_tiles_x + tx;
-                int write_idx = h_tile_offsets[tile_id] + tile_cursor[tile_id]++;
-                h_tile_splat_indices[write_idx] = idx;
+            for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
+                for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
+                    int tile_id = ty * num_tiles_x + tx;
+                    int write_idx = h_tile_offsets[tile_id] + tile_cursor[tile_id]++;
+                    h_tile_splat_indices[write_idx] = idx;
+                }
             }
         }
+
+        total_tile_refs = h_tile_splat_indices.size();
     }
 
     printf("✅ Built tile lists: %zu total splat references across %d tiles\n",
@@ -326,18 +346,21 @@ bool Rasterizer::render_cuda(
     printf("📤 Uploading data to GPU...\n");
     fflush(stdout);
 
-    CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), 
-                         num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), 
-                         num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_colors_, h_colors.data(), 
-                         num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), 
-                         num_splats * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(),
-                         h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(),
-                         (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    {
+        ScopedTimer timer("upload_h2d", &t_h2d_ms);
+        CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), 
+                             num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), 
+                             num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_colors_, h_colors.data(), 
+                             num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), 
+                             num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(),
+                             h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(),
+                             (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     printf("✅ Uploaded data to GPU\n");
     fflush(stdout);
@@ -349,6 +372,9 @@ bool Rasterizer::render_cuda(
     printf("🔧 Launching tile-based kernel: grid(%d, %d), block(%d, %d)\n",
            grid.x, grid.y, block.x, block.y);
     fflush(stdout);
+
+    CudaTimer kernel_timer("raster_kernel", &gpu_total_ms);
+    kernel_timer.start();
 
     splatKernel<<<grid, block>>>(
         d_means2D_,
@@ -372,12 +398,24 @@ bool Rasterizer::render_cuda(
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    kernel_timer.stop();
     printf("✅ Kernel execution completed\n");
 
-    CUDA_CHECK(cudaMemcpy(output_image, d_output_, 
-                         width * height * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    {
+        ScopedTimer timer("download_d2h", &t_d2h_ms);
+        CUDA_CHECK(cudaMemcpy(output_image, d_output_, 
+                             width * height * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    }
     
     printf("✅ Downloaded output image from GPU\n");
+
+#if ENABLE_PROFILING
+    double cpu_total_ms = t_sh_ms + t_tile_ms + t_h2d_ms + t_d2h_ms;
+    std::printf("[Profile] stats: splats_total=%d, tile_refs=%zu, res=%dx%d\n",
+                num_splats, total_tile_refs, width, height);
+    std::printf("[Profile] total_cpu_render: %.3f ms | total_gpu: %.3f ms\n",
+                cpu_total_ms, static_cast<double>(gpu_total_ms));
+#endif
 
     // Cleanup
     cudaFree(d_tile_splat_list);

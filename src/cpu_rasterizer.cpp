@@ -4,6 +4,7 @@
 #include "gs/ellipse.h"
 #include "gs/sh_color.h"
 #include "gs/ply_loader.h"
+#include "gs/profiler.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -211,8 +212,12 @@ bool Rasterizer::saveFramebuffer(
         outBytes[idx + 2] = static_cast<unsigned char>(std::clamp(p.b, 0.0f, 1.0f) * 255.0f);
     }
 
-    // Save PNG
-    int ok = stbi_write_png(output_path.c_str(), width, height, 3, outBytes.data(), width * 3);
+    double save_png_ms = 0.0;
+    int ok = 0;
+    {
+        ScopedTimer timer("save_png", &save_png_ms);
+        ok = stbi_write_png(output_path.c_str(), width, height, 3, outBytes.data(), width * 3);
+    }
 
     if (ok) {
         std::cout << "Saved: " << output_path << std::endl;
@@ -234,8 +239,15 @@ bool Rasterizer::prepareForCuda(
 ) {
     std::cout << "🔄 CPU Preprocessing for CUDA V1..." << std::endl;
 
+    double t_load_ms = 0.0;
+    double t_project_ms = 0.0;
+    double t_sort_ms = 0.0;
+
     // Load Gaussian Splats from PLY
-    out_splats = gs::loadGaussianPly(ply_path);
+    {
+        ScopedTimer timer("load_ply", &t_load_ms);
+        out_splats = gs::loadGaussianPly(ply_path);
+    }
     std::vector<gs::GaussianSplat>& splats = out_splats;
     
     if (splats.empty()) {
@@ -246,12 +258,28 @@ bool Rasterizer::prepareForCuda(
     std::cout << "Loaded " << splats.size() << " Gaussian splats." << std::endl;
 
     // Project to screen space
-    if (!projectSplats(splats, view, proj, width, height, out_screen_splats)) {
-        return false;
+    {
+        ScopedTimer timer("project_splats", &t_project_ms);
+        if (!projectSplats(splats, view, proj, width, height, out_screen_splats)) {
+            return false;
+        }
     }
 
     // Sort by depth (back-to-front)
-    sortByDepth(out_screen_splats);
+    {
+        ScopedTimer timer("sort_by_depth", &t_sort_ms);
+        sortByDepth(out_screen_splats);
+    }
+
+#if ENABLE_PROFILING
+    double cpu_total_ms = t_load_ms + t_project_ms + t_sort_ms;
+    std::printf("[Profile] total_cpu_preprocess: %.3f ms | splats: %zu -> %zu | res: %dx%d\n",
+                cpu_total_ms,
+                splats.size(),
+                out_screen_splats.size(),
+                width,
+                height);
+#endif
 
     std::cout << "✅ CPU preprocessing complete: " 
               << out_screen_splats.size() << " splats ready for CUDA" << std::endl;
