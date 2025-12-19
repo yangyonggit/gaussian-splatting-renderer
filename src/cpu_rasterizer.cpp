@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#if defined(GS_ENABLE_IMAGE_WRITE)
 #include <stb_image_write.h>
+#endif
 
 namespace CpuRasterizer {
 
@@ -196,17 +198,17 @@ bool Rasterizer::rasterize(
     return true;
 }
 
+#if defined(GS_ENABLE_IMAGE_WRITE)
 bool Rasterizer::saveFramebuffer(
     const std::vector<FloatPixel>& framebuffer,
     int width,
     int height,
     const std::string& output_path
 ) {
-    // Convert float framebuffer to byte array
     std::vector<unsigned char> outBytes(framebuffer.size() * 3);
     for (size_t i = 0; i < framebuffer.size(); ++i) {
         const FloatPixel& p = framebuffer[i];
-        int idx = i * 3;
+        int idx = static_cast<int>(i * 3);
         outBytes[idx + 0] = static_cast<unsigned char>(std::clamp(p.r, 0.0f, 1.0f) * 255.0f);
         outBytes[idx + 1] = static_cast<unsigned char>(std::clamp(p.g, 0.0f, 1.0f) * 255.0f);
         outBytes[idx + 2] = static_cast<unsigned char>(std::clamp(p.b, 0.0f, 1.0f) * 255.0f);
@@ -227,6 +229,21 @@ bool Rasterizer::saveFramebuffer(
         return false;
     }
 }
+#else
+bool Rasterizer::saveFramebuffer(
+    const std::vector<FloatPixel>& framebuffer,
+    int width,
+    int height,
+    const std::string& output_path
+) {
+    (void)framebuffer;
+    (void)width;
+    (void)height;
+    (void)output_path;
+    std::cout << "[Info] Image saving disabled for this build (no STB)." << std::endl;
+    return true;
+}
+#endif
 
 bool Rasterizer::prepareForCuda(
     const std::string& ply_path,

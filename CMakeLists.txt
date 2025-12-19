@@ -65,6 +65,39 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nlohmann_json)
 
+# --- Dependency: GLFW (Window & Input) ---
+message(STATUS "⬇️  Fetching GLFW...")
+# Disable GLFW extras to avoid building examples/tests/docs
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "Build GLFW examples" FORCE)
+set(GLFW_BUILD_TESTS    OFF CACHE BOOL "Build GLFW tests"    FORCE)
+set(GLFW_BUILD_DOCS     OFF CACHE BOOL "Build GLFW docs"     FORCE)
+set(GLFW_INSTALL        OFF CACHE BOOL "Install GLFW"        FORCE)
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.3.8
+)
+FetchContent_MakeAvailable(glfw)
+
+# --- Vendored GLAD (OpenGL Loader) ---
+# GLAD files are pre-generated and stored in external/glad/
+# No network access required - fully offline build
+message(STATUS "🎨 Configuring vendored GLAD...")
+
+add_library(glad STATIC
+    ${CMAKE_SOURCE_DIR}/external/glad/src/glad.c
+)
+
+target_include_directories(glad PUBLIC
+    ${CMAKE_SOURCE_DIR}/external/glad/include
+)
+
+# Link OpenGL on Windows
+if(WIN32)
+    target_link_libraries(glad PUBLIC opengl32)
+endif()
+
+message(STATUS "✅ GLAD configured (vendored, offline)")
 
 # ----------------------------------------------------------
 # 2. Source Code Configuration
@@ -72,6 +105,11 @@ FetchContent_MakeAvailable(nlohmann_json)
 # Recursively find all .cpp and .cu files in the src/ directory
 file(GLOB_RECURSE CPP_SOURCES "src/*.cpp")
 file(GLOB_RECURSE CUDA_SOURCES "src/*.cu")
+
+# Exclude viewer_main.cpp from MiniGSRenderer target
+list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/viewer_main.cpp")
+# Exclude legacy STB impl TU to avoid duplicate symbol definitions
+list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/stb_image_write_impl.cpp")
 
 # Create the executable target
 add_executable(MiniGSRenderer ${CPP_SOURCES} ${CUDA_SOURCES})
@@ -103,5 +141,56 @@ target_include_directories(MiniGSRenderer
     PRIVATE
         ${CMAKE_SOURCE_DIR}/include
 )
+
+# ----------------------------------------------------------
+# 4. Viewer Target (Stage A - Interactive Viewer)
+# ----------------------------------------------------------
+message(STATUS "🎮 Building viewer target...")
+
+# Viewer executable with vendored GLAD (no network required)
+add_executable(viewer_main 
+    src/viewer_main.cpp 
+    src/cuda_rasterizer.cu 
+    src/cpu_rasterizer.cpp 
+    src/ellipse.cpp 
+    src/ply_loader.cpp 
+    src/sh_color.cpp
+)
+
+target_link_libraries(viewer_main PRIVATE
+    glm::glm
+    glfw
+    glad              # Vendored GLAD static library
+    CUDA::cudart
+    nlohmann_json::nlohmann_json
+)
+
+target_include_directories(viewer_main 
+    PRIVATE 
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# Put both executables in the same directory
+set_target_properties(viewer_main MiniGSRenderer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+)
+
+# Enable image writing only for the CLI target
+target_compile_definitions(MiniGSRenderer PRIVATE GS_ENABLE_IMAGE_WRITE=1)
+
+message(STATUS "✅ Viewer target configured")
+
+# Use UTF-8 source encoding on MSVC to silence C4819 warnings
+# Apply correctly per language to avoid passing `/utf-8` raw to NVCC
+if(MSVC)
+    target_compile_options(MiniGSRenderer PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
+    )
+    target_compile_options(viewer_main PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
+    )
+endif()
 
 message(STATUS "✅ Setup Complete! Ready to build.")

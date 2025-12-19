@@ -2,7 +2,7 @@
 
 // Lightweight profiling helpers. Toggle with ENABLE_PROFILING.
 #ifndef ENABLE_PROFILING
-#define ENABLE_PROFILING 1
+#define ENABLE_PROFILING 0
 #endif
 
 #if ENABLE_PROFILING
