@@ -49,6 +49,15 @@ public:
         float* output_image
     );
 
+    /**
+     * Upload scene-static SH coefficients, positions, and opacities to GPU.
+     * Call once after loading PLY. Allocates persistent device buffers.
+     * 
+     * @param gaussians Vector of GaussianSplat objects
+     * @return true on success
+     */
+    bool uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians);
+
     // Render directly into a device RGBA8 buffer (e.g., mapped GL PBO)
     // out_rgba8_device must point to width*height*4 bytes allocated on device.
     bool render_cuda_to_rgba8_device(
@@ -71,6 +80,13 @@ private:
     float* d_colors_;       // RGB colors [N*3]
     float* d_opacities_;    // Opacity values [N]
     float* d_output_;       // Output image [W*H*3]
+
+    // Scene-static data (uploaded once, kept resident across frames)
+    float* d_pos_ws_ = nullptr;         // World positions [N*3]: (x,y,z) interleaved
+    float* d_sh_coeffs_ = nullptr;      // SH coefficients [N*27]: (R_0..8, G_0..8, B_0..8) - Degree 2
+    float* d_dc_colors_ = nullptr;      // DC (0-order SH) colors [N*3]
+    size_t scene_splat_capacity_ = 0;   // Capacity for scene data
+    size_t scene_num_splats_ = 0;       // Number of splats currently loaded
 
     // Cached tile buffers (capacity-managed)
     int* d_tile_splat_list_ = nullptr; // flat list of indices

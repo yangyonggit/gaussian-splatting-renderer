@@ -34,6 +34,7 @@
 #include "gs/fps_camera.h"
 #include "gs/gl_utils.h"
 #include "gs/profiler.h"
+#include "gs/sh_color.h"
 #include "cpu_rasterizer.h"
 #include "cuda_rasterizer.h"
 
@@ -322,6 +323,18 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "✅ Scene loaded: " << splats.size() << " splats" << std::endl;
+
+    // Upload scene-static data (SH coefficients, positions) to GPU (once)
+    std::cout << "📤 Uploading scene-static SH data to GPU..." << std::endl;
+    if (!cuda_rasterizer.uploadSceneData(splats)) {
+        std::cerr << "Failed to upload scene data to GPU" << std::endl;
+        glfwTerminate();
+        return 1;
+    }
+
+
+    
+
 
     // No CPU image needed with PBO interop
 

@@ -152,6 +152,13 @@ int main(int argc, char* argv[]) {
         CudaRasterizer::Rasterizer cuda_rasterizer;
         std::vector<float> output_image(cam.width * cam.height * 3);
 
+        // Upload scene-static data (SH coefficients, positions) to GPU
+        std::cout << "📤 Uploading scene data to GPU..." << std::endl;
+        if (!cuda_rasterizer.uploadSceneData(splats)) {
+            std::cerr << "❌ Failed to upload scene data to GPU" << std::endl;
+            return 1;
+        }
+
         if (!cuda_rasterizer.render_cuda(
             screen_splats,
             cam.position,
