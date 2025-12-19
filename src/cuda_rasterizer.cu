@@ -171,6 +171,10 @@ Rasterizer::Rasterizer()
     , d_colors_(nullptr)
     , d_opacities_(nullptr)
     , d_output_(nullptr)
+    , d_tile_splat_list_(nullptr)
+    , d_tile_offsets_(nullptr)
+    , tile_splat_list_capacity_(0)
+    , tile_offsets_capacity_(0)
     , num_splats_(0)
     , width_(0)
     , height_(0)
@@ -205,10 +209,26 @@ void Rasterizer::freeBuffers() {
     if (d_colors_) { cudaFree(d_colors_); d_colors_ = nullptr; }
     if (d_opacities_) { cudaFree(d_opacities_); d_opacities_ = nullptr; }
     if (d_output_) { cudaFree(d_output_); d_output_ = nullptr; }
+    if (d_tile_splat_list_) { cudaFree(d_tile_splat_list_); d_tile_splat_list_ = nullptr; tile_splat_list_capacity_ = 0; }
+    if (d_tile_offsets_) { cudaFree(d_tile_offsets_); d_tile_offsets_ = nullptr; tile_offsets_capacity_ = 0; }
 }
 
 void Rasterizer::free() {
     freeBuffers();
+}
+
+bool Rasterizer::ensureTileBuffers(size_t splat_list_count, size_t offsets_count) {
+    if (splat_list_count > tile_splat_list_capacity_) {
+        if (d_tile_splat_list_) cudaFree(d_tile_splat_list_);
+        CUDA_CHECK(cudaMalloc(&d_tile_splat_list_, splat_list_count * sizeof(int)));
+        tile_splat_list_capacity_ = splat_list_count;
+    }
+    if (offsets_count > tile_offsets_capacity_) {
+        if (d_tile_offsets_) cudaFree(d_tile_offsets_);
+        CUDA_CHECK(cudaMalloc(&d_tile_offsets_, offsets_count * sizeof(int)));
+        tile_offsets_capacity_ = offsets_count;
+    }
+    return true;
 }
 
 bool Rasterizer::render_cuda(
@@ -358,11 +378,11 @@ bool Rasterizer::render_cuda(
     fflush(stdout);
 
     // Allocate device memory for tile lists
-    int* d_tile_splat_list = nullptr;
-    int* d_tile_offsets = nullptr;
-
-    CUDA_CHECK(cudaMalloc(&d_tile_splat_list, h_tile_splat_indices.size() * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_tile_offsets, (num_tiles + 1) * sizeof(int)));
+    // Ensure tile buffers have capacity and upload
+    if (!ensureTileBuffers(h_tile_splat_indices.size(), (size_t)(num_tiles + 1))) {
+        fprintf(stderr, "Failed to ensure tile buffer capacity\n");
+        return false;
+    }
 
     // Upload data to GPU
     printf("📤 Uploading data to GPU...\n");
@@ -378,9 +398,9 @@ bool Rasterizer::render_cuda(
                              num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), 
                              num_splats * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(),
+        CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(),
                              h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(),
+        CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(),
                              (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
     }
 
@@ -403,8 +423,8 @@ bool Rasterizer::render_cuda(
         d_conic3D_,
         d_colors_,
         d_opacities_,
-        d_tile_splat_list,
-        d_tile_offsets,
+        d_tile_splat_list_,
+        d_tile_offsets_,
         num_tiles_x,
         width,
         height,
@@ -414,22 +434,18 @@ bool Rasterizer::render_cuda(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Kernel Launch Error: %s\n", cudaGetErrorString(err));
-        cudaFree(d_tile_splat_list);
-        cudaFree(d_tile_offsets);
         return false;
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-    kernel_timer.stop();
-    printf("✅ Kernel execution completed\n");
-
+    // No explicit sync; host copy will synchronize
     {
         ScopedTimer timer("download_d2h", &t_d2h_ms);
         CUDA_CHECK(cudaMemcpy(output_image, d_output_, 
                              width * height * 3 * sizeof(float), cudaMemcpyDeviceToHost));
     }
-    
-    printf("✅ Downloaded output image from GPU\n");
+
+    // Stop timer after copy (implies kernel completion)
+    kernel_timer.stop();
 
 #if ENABLE_PROFILING
     double cpu_total_ms = t_sh_ms + t_tile_ms + t_h2d_ms + t_d2h_ms;
@@ -439,9 +455,7 @@ bool Rasterizer::render_cuda(
                 cpu_total_ms, static_cast<double>(gpu_total_ms));
 #endif
 
-    // Cleanup
-    cudaFree(d_tile_splat_list);
-    cudaFree(d_tile_offsets);
+    // Tile buffers are cached across frames; do not free here
 
     return true;
 }
@@ -525,36 +539,33 @@ bool Rasterizer::render_cuda_to_rgba8_device(
     }
 
     // Upload
-    int* d_tile_splat_list = nullptr;
-    int* d_tile_offsets = nullptr;
+    // Ensure capacity and upload tile buffers
+    if (!ensureTileBuffers(h_tile_splat_indices.size(), (size_t)(num_tiles + 1))) {
+        fprintf(stderr, "Failed to ensure tile buffer capacity\n");
+        return false;
+    }
     CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_colors_, h_colors.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&d_tile_splat_list, h_tile_splat_indices.size() * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_tile_offsets, (num_tiles + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(), h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(), (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(), h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(), (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
     // Render
     dim3 block(16, 16);
     dim3 grid(num_tiles_x, num_tiles_y);
     splatKernel<<<grid, block>>>(
         d_means2D_, d_conic3D_, d_colors_, d_opacities_,
-        d_tile_splat_list, d_tile_offsets,
+        d_tile_splat_list_, d_tile_offsets_,
         num_tiles_x,
         width, height,
         d_output_);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Pack to RGBA8 directly into provided device buffer (PBO)
     dim3 p(16, 16);
     dim3 g((width + 15)/16, (height + 15)/16);
     packToRGBA8<<<g, p>>>(d_output_, out_rgba8_device, width, height);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaFree(d_tile_splat_list);
-    cudaFree(d_tile_offsets);
     return true;
 }
 

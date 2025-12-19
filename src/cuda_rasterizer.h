@@ -72,12 +72,21 @@ private:
     float* d_opacities_;    // Opacity values [N]
     float* d_output_;       // Output image [W*H*3]
 
+    // Cached tile buffers (capacity-managed)
+    int* d_tile_splat_list_ = nullptr; // flat list of indices
+    int* d_tile_offsets_ = nullptr;    // tile offsets (num_tiles+1)
+    size_t tile_splat_list_capacity_ = 0; // number of ints allocated
+    size_t tile_offsets_capacity_ = 0;     // number of ints allocated
+
     int num_splats_;
     int width_, height_;
 
     // Internal memory management
     bool allocateBuffers(int num_splats, int width, int height);
     void freeBuffers();
+    
+    // Ensure tile buffers have enough capacity; realloc only when needed
+    bool ensureTileBuffers(size_t splat_list_count, size_t offsets_count);
 };
 
 } // namespace CudaRasterizer
