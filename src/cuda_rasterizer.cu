@@ -139,6 +139,28 @@ __global__ void splatKernel(
     output[pixel_idx * 3 + 2] = C_b;
 }
 
+// Pack float RGB [0,1] into RGBA8 buffer on device
+__global__ void packToRGBA8(const float* __restrict__ src_rgb,
+                            unsigned char* __restrict__ dst_rgba8,
+                            int width,
+                            int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int idx = y * width + x;
+    float r = src_rgb[idx * 3 + 0];
+    float g = src_rgb[idx * 3 + 1];
+    float b = src_rgb[idx * 3 + 2];
+    r = fminf(fmaxf(r, 0.0f), 1.0f);
+    g = fminf(fmaxf(g, 0.0f), 1.0f);
+    b = fminf(fmaxf(b, 0.0f), 1.0f);
+    int o = idx * 4;
+    dst_rgba8[o + 0] = static_cast<unsigned char>(r * 255.0f + 0.5f);
+    dst_rgba8[o + 1] = static_cast<unsigned char>(g * 255.0f + 0.5f);
+    dst_rgba8[o + 2] = static_cast<unsigned char>(b * 255.0f + 0.5f);
+    dst_rgba8[o + 3] = 255;
+}
+
 // ============================================================
 // Host Code: Memory Management and Rendering
 // ============================================================
@@ -421,6 +443,118 @@ bool Rasterizer::render_cuda(
     cudaFree(d_tile_splat_list);
     cudaFree(d_tile_offsets);
 
+    return true;
+}
+
+bool Rasterizer::render_cuda_to_rgba8_device(
+    const std::vector<gs::ScreenSplat>& screen_splats,
+    const glm::vec3& camera_pos,
+    int width,
+    int height,
+    unsigned char* out_rgba8_device
+) {
+    // Reuse the existing pipeline through tile building and kernel, but pack to device
+    int num_splats = static_cast<int>(screen_splats.size());
+    if (num_splats == 0) {
+        fprintf(stderr, "Error: No splats to render!\n");
+        return false;
+    }
+
+    // Allocate buffers and prepare SoA like in render_cuda
+    if (!allocateBuffers(num_splats, width, height)) return false;
+
+    std::vector<float> h_means2D(num_splats * 2);
+    std::vector<float> h_conic3D(num_splats * 3);
+    std::vector<float> h_colors(num_splats * 3);
+    std::vector<float> h_opacities(num_splats);
+
+    for (int i = 0; i < num_splats; ++i) {
+        const gs::ScreenSplat& sp = screen_splats[i];
+        if (!sp.src) { fprintf(stderr, "Null src at %d\n", i); return false; }
+        h_means2D[i * 2 + 0] = sp.sx;
+        h_means2D[i * 2 + 1] = sp.sy;
+        h_conic3D[i * 3 + 0] = sp.cov_inv[0][0];
+        h_conic3D[i * 3 + 1] = sp.cov_inv[0][1];
+        h_conic3D[i * 3 + 2] = sp.cov_inv[1][1];
+        const gs::GaussianSplat& src = *sp.src;
+        glm::vec3 view_dir = glm::normalize(camera_pos - src.position_ws);
+        glm::vec3 color = gs::evalSHColor(src, view_dir);
+        color = glm::clamp(color, 0.0f, 1.0f);
+        h_colors[i * 3 + 0] = color.r;
+        h_colors[i * 3 + 1] = color.g;
+        h_colors[i * 3 + 2] = color.b;
+        h_opacities[i] = src.opacity;
+    }
+
+    int num_tiles_x = (width + 15) / 16;
+    int num_tiles_y = (height + 15) / 16;
+    int num_tiles = num_tiles_x * num_tiles_y;
+    std::vector<int> h_tile_splat_indices;
+    std::vector<int> h_tile_offsets(num_tiles + 1, 0);
+
+    // Count
+    std::vector<int> tile_counts(num_tiles, 0);
+    for (int idx = 0; idx < num_splats; ++idx) {
+        const gs::ScreenSplat& sp = screen_splats[idx];
+        float radius = sp.radius_px;
+        int tx0 = max(0, (int)((sp.sx - radius) / 16.0f));
+        int tx1 = min(num_tiles_x - 1, (int)((sp.sx + radius) / 16.0f));
+        int ty0 = max(0, (int)((sp.sy - radius) / 16.0f));
+        int ty1 = min(num_tiles_y - 1, (int)((sp.sy + radius) / 16.0f));
+        for (int ty = ty0; ty <= ty1; ++ty)
+            for (int tx = tx0; tx <= tx1; ++tx)
+                ++tile_counts[ty * num_tiles_x + tx];
+    }
+    for (int t = 0; t < num_tiles; ++t) h_tile_offsets[t + 1] = h_tile_offsets[t] + tile_counts[t];
+    h_tile_splat_indices.assign(h_tile_offsets[num_tiles], 0);
+    std::vector<int> cursor(num_tiles, 0);
+    for (int idx = 0; idx < num_splats; ++idx) {
+        const gs::ScreenSplat& sp = screen_splats[idx];
+        float radius = sp.radius_px;
+        int tx0 = max(0, (int)((sp.sx - radius) / 16.0f));
+        int tx1 = min(num_tiles_x - 1, (int)((sp.sx + radius) / 16.0f));
+        int ty0 = max(0, (int)((sp.sy - radius) / 16.0f));
+        int ty1 = min(num_tiles_y - 1, (int)((sp.sy + radius) / 16.0f));
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                int tile_id = ty * num_tiles_x + tx;
+                int w = h_tile_offsets[tile_id] + cursor[tile_id]++;
+                h_tile_splat_indices[w] = idx;
+            }
+        }
+    }
+
+    // Upload
+    int* d_tile_splat_list = nullptr;
+    int* d_tile_offsets = nullptr;
+    CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_colors_, h_colors.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_tile_splat_list, h_tile_splat_indices.size() * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tile_offsets, (num_tiles + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_tile_splat_list, h_tile_splat_indices.data(), h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tile_offsets, h_tile_offsets.data(), (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Render
+    dim3 block(16, 16);
+    dim3 grid(num_tiles_x, num_tiles_y);
+    splatKernel<<<grid, block>>>(
+        d_means2D_, d_conic3D_, d_colors_, d_opacities_,
+        d_tile_splat_list, d_tile_offsets,
+        num_tiles_x,
+        width, height,
+        d_output_);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Pack to RGBA8 directly into provided device buffer (PBO)
+    dim3 p(16, 16);
+    dim3 g((width + 15)/16, (height + 15)/16);
+    packToRGBA8<<<g, p>>>(d_output_, out_rgba8_device, width, height);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_tile_splat_list);
+    cudaFree(d_tile_offsets);
     return true;
 }
 

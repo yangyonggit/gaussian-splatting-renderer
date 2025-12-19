@@ -49,6 +49,16 @@ public:
         float* output_image
     );
 
+    // Render directly into a device RGBA8 buffer (e.g., mapped GL PBO)
+    // out_rgba8_device must point to width*height*4 bytes allocated on device.
+    bool render_cuda_to_rgba8_device(
+        const std::vector<gs::ScreenSplat>& screen_splats,
+        const glm::vec3& camera_pos,
+        int width,
+        int height,
+        unsigned char* out_rgba8_device
+    );
+
     /**
      * Free all GPU memory
      */

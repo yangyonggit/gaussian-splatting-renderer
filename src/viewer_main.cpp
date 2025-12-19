@@ -28,6 +28,8 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <cuda_runtime.h>
+#include <cuda_gl_interop.h>
 
 #include "gs/fps_camera.h"
 #include "gs/gl_utils.h"
@@ -279,6 +281,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Create PBO for CUDA-GL interop
+    GLuint pbo = 0;
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, WINDOW_WIDTH * WINDOW_HEIGHT * 4, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    // Register PBO with CUDA
+    cudaGraphicsResource* cuda_pbo_resource = nullptr;
+    if (cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
+        std::cerr << "Failed to register PBO with CUDA" << std::endl;
+        glfwTerminate();
+        return 1;
+    }
+
     std::cout << "✅ GL resources created" << std::endl;
 
     // ---- Prepare CUDA Renderer ----
@@ -306,9 +323,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "✅ Scene loaded: " << splats.size() << " splats" << std::endl;
 
-    // Allocate CPU-side output buffer (RGBA8)
-    std::vector<uint8_t> cpu_image(WINDOW_WIDTH * WINDOW_HEIGHT * 4);
-    std::vector<float> cuda_output(WINDOW_WIDTH * WINDOW_HEIGHT * 3);
+    // No CPU image needed with PBO interop
 
     // ---- Main Loop ----
     std::cout << "\n▶️  Entering main loop..." << std::endl;
@@ -335,40 +350,32 @@ int main(int argc, char* argv[]) {
         // ---- Render Frame (CUDA) ----
         {
             ScopedTimer timer("cuda_render_frame");
+            // Map PBO for CUDA write
+            cudaGraphicsMapResources(1, &cuda_pbo_resource);
+            void* d_ptr = nullptr;
+            size_t mapped_size = 0;
+            cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, cuda_pbo_resource);
 
-            // Get updated view/proj from camera
-            glm::mat4 view = camera.getViewMatrix();
-            glm::mat4 proj = camera.getProjMatrix(WINDOW_WIDTH / (float)WINDOW_HEIGHT);
-
-            // SLOW PATH: Render using CUDA, download to CPU, upload to GPU texture
-            // NOTE: This path does NOT update splats based on camera; it uses preloaded
-            // screen_splats from initial dummy camera. For a proper viewer, we'd re-project
-            // here or cache view-invariant data. For now, this is a placeholder.
-            
-            // TODO: Re-compute screen_splats with updated view/proj, or pass view/proj
-            //       to CUDA renderer for on-GPU projection. For Stage A, we render
-            //       the same frame repeatedly. Stage B will implement async updates.
-
-            if (!cuda_rasterizer.render_cuda(screen_splats, camera.getPosition(),
-                                              WINDOW_WIDTH, WINDOW_HEIGHT,
-                                              cuda_output.data())) {
-                std::cerr << "CUDA rendering failed" << std::endl;
+            // Render directly into PBO as RGBA8
+            if (!cuda_rasterizer.render_cuda_to_rgba8_device(
+                    screen_splats, camera.getPosition(),
+                    WINDOW_WIDTH, WINDOW_HEIGHT,
+                    reinterpret_cast<unsigned char*>(d_ptr))) {
+                std::cerr << "CUDA rendering (PBO) failed" << std::endl;
+                cudaGraphicsUnmapResources(1, &cuda_pbo_resource);
                 break;
             }
 
-            // Convert float RGB to RGBA8 (add opaque alpha)
-            for (int i = 0; i < WINDOW_WIDTH * WINDOW_HEIGHT; ++i) {
-                cpu_image[i * 4 + 0] = static_cast<uint8_t>(
-                    std::clamp(cuda_output[i * 3 + 0], 0.0f, 1.0f) * 255.0f);
-                cpu_image[i * 4 + 1] = static_cast<uint8_t>(
-                    std::clamp(cuda_output[i * 3 + 1], 0.0f, 1.0f) * 255.0f);
-                cpu_image[i * 4 + 2] = static_cast<uint8_t>(
-                    std::clamp(cuda_output[i * 3 + 2], 0.0f, 1.0f) * 255.0f);
-                cpu_image[i * 4 + 3] = 255;
-            }
+            cudaGraphicsUnmapResources(1, &cuda_pbo_resource);
 
-            // ---- SLOW PATH: Upload to GL Texture ----
-            render_target.update(cpu_image.data(), GL_RGBA);
+            // Update texture from PBO without CPU copy
+            glBindTexture(GL_TEXTURE_2D, 0); // ensure our wrapper binds later
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            // Bind our texture and upload from PBO
+            render_target.bind(0);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
+                            GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         }
 
         // ---- Render to Screen ----
@@ -399,6 +406,8 @@ int main(int argc, char* argv[]) {
     std::cout << "\n🧹 Cleaning up..." << std::endl;
     quad.cleanup();
     render_target.cleanup();
+    if (cuda_pbo_resource) cudaGraphicsUnregisterResource(cuda_pbo_resource);
+    if (pbo) glDeleteBuffers(1, &pbo);
     glDeleteProgram(program);
     cuda_rasterizer.free();
 
