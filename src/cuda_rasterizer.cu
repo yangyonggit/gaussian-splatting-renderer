@@ -187,20 +187,24 @@ __device__ inline void evalSH9_device(const glm::vec3& dir, float* sh)
 // Evaluate SH color for all splats given camera position
 // One thread per splat
 __global__ void evalSHColorKernel(
-    const float* __restrict__ pos_ws_xyz,      // [N*3] world-space positions (x,y,z interleaved)
-    const float* __restrict__ dc_colors,       // [N*3] DC colors (0-order SH)
-    const float* __restrict__ sh_coeffs,       // [N*27] SH coefficients
-    float cam_x, float cam_y, float cam_z,     // Camera position components
+    const int* __restrict__ gaussian_ids,       // [N] gaussian index for each screen splat
+    const float* __restrict__ pos_ws_xyz,       // [num_gaussians*3] world-space positions
+    const float* __restrict__ dc_colors,        // [num_gaussians*3] DC colors
+    const float* __restrict__ sh_coeffs,        // [num_gaussians*27] SH coefficients
+    float cam_x, float cam_y, float cam_z,      // Camera position components
     int num_splats,
-    float* __restrict__ out_colors             // [N*3] output RGB colors
+    float* __restrict__ out_colors              // [num_splats*3] output RGB colors
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_splats) return;
 
+    // Map screen splat to source gaussian
+    int gid = gaussian_ids[idx];
+
     // Compute view direction (extract position as float3)
-    float pos_x = pos_ws_xyz[idx * 3 + 0];
-    float pos_y = pos_ws_xyz[idx * 3 + 1];
-    float pos_z = pos_ws_xyz[idx * 3 + 2];
+    float pos_x = pos_ws_xyz[gid * 3 + 0];
+    float pos_y = pos_ws_xyz[gid * 3 + 1];
+    float pos_z = pos_ws_xyz[gid * 3 + 2];
     
     float view_x = cam_x - pos_x;
     float view_y = cam_y - pos_y;
@@ -229,17 +233,17 @@ __global__ void evalSHColorKernel(
     sh[8] =  0.5462742152960396f * (x * x - y * y);
 
     // Start with DC color
-    float r = dc_colors[idx * 3 + 0];
-    float g = dc_colors[idx * 3 + 1];
-    float b = dc_colors[idx * 3 + 2];
+    float r = dc_colors[gid * 3 + 0];
+    float g = dc_colors[gid * 3 + 1];
+    float b = dc_colors[gid * 3 + 2];
 
     // Add higher-order SH contributions (indices 1..8, skip DC at 0)
     #pragma unroll 8
     for (int basis = 1; basis < 9; ++basis) {
         float w = sh[basis];
-        r += sh_coeffs[idx * 27 + 0 * 9 + basis] * w;      // R coefficients at [0..8]
-        g += sh_coeffs[idx * 27 + 1 * 9 + basis] * w;      // G coefficients at [9..17]
-        b += sh_coeffs[idx * 27 + 2 * 9 + basis] * w;      // B coefficients at [18..26]
+        r += sh_coeffs[gid * 27 + 0 * 9 + basis] * w;      // R coefficients at [0..8]
+        g += sh_coeffs[gid * 27 + 1 * 9 + basis] * w;      // G coefficients at [9..17]
+        b += sh_coeffs[gid * 27 + 2 * 9 + basis] * w;      // B coefficients at [18..26]
     }
 
     // Clamp to [0, 1]
@@ -251,7 +255,6 @@ __global__ void evalSHColorKernel(
     out_colors[idx * 3 + 0] = r;
     out_colors[idx * 3 + 1] = g;
     out_colors[idx * 3 + 2] = b;
-
 }
 
 // ============================================================
@@ -278,42 +281,83 @@ Rasterizer::~Rasterizer() {
     free();
 }
 
-bool Rasterizer::allocateBuffers(int num_splats, int width, int height) {
-    freeBuffers(); // Free old buffers if any
+bool Rasterizer::ensureFrameBuffers(int num_splats, int width, int height) {
+    // Only reallocate if capacity grows
+    if (num_splats <= frame_buffer_capacity_ && width_ == width && height_ == height) {
+        num_splats_ = num_splats;
+        return true;
+    }
 
     num_splats_ = num_splats;
     width_ = width;
     height_ = height;
+    frame_buffer_capacity_ = num_splats;
 
-    // Allocate device memory
+    // Allocate device memory for frame buffers
+    if (d_means2D_) cudaFree(d_means2D_);
+    if (d_conic3D_) cudaFree(d_conic3D_);
+    if (d_colors_) cudaFree(d_colors_);
+    if (d_opacities_) cudaFree(d_opacities_);
+    if (d_output_) cudaFree(d_output_);
+    if (d_gaussian_ids_) cudaFree(d_gaussian_ids_);
+
     CUDA_CHECK(cudaMalloc(&d_means2D_, num_splats * 2 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conic3D_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_colors_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_opacities_, num_splats * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_output_, width * height * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_gaussian_ids_, num_splats * sizeof(int)));
 
-    printf("✅ Allocated CUDA buffers: %d splats, %dx%d image\n", num_splats, width, height);
+    printf("✅ Ensured frame buffers: %d splats, %dx%d image\n", num_splats, width, height);
     return true;
 }
 
-void Rasterizer::freeBuffers() {
+void Rasterizer::freeFrameBuffers() {
     if (d_means2D_) { cudaFree(d_means2D_); d_means2D_ = nullptr; }
     if (d_conic3D_) { cudaFree(d_conic3D_); d_conic3D_ = nullptr; }
     if (d_colors_) { cudaFree(d_colors_); d_colors_ = nullptr; }
     if (d_opacities_) { cudaFree(d_opacities_); d_opacities_ = nullptr; }
     if (d_output_) { cudaFree(d_output_); d_output_ = nullptr; }
+    if (d_gaussian_ids_) { cudaFree(d_gaussian_ids_); d_gaussian_ids_ = nullptr; }
     if (d_tile_splat_list_) { cudaFree(d_tile_splat_list_); d_tile_splat_list_ = nullptr; tile_splat_list_capacity_ = 0; }
     if (d_tile_offsets_) { cudaFree(d_tile_offsets_); d_tile_offsets_ = nullptr; tile_offsets_capacity_ = 0; }
+    frame_buffer_capacity_ = 0;
+    
+    // Host buffers: shrink to zero but keep capacity
+    h_means2D_.clear();
+    h_conic3D_.clear();
+    h_opacities_.clear();
+    h_gaussian_ids_.clear();
 }
 
 void Rasterizer::free() {
-    freeBuffers();
+    freeFrameBuffers();
     // Free scene-static data
     if (d_pos_ws_) { cudaFree(d_pos_ws_); d_pos_ws_ = nullptr; }
     if (d_sh_coeffs_) { cudaFree(d_sh_coeffs_); d_sh_coeffs_ = nullptr; }
     if (d_dc_colors_) { cudaFree(d_dc_colors_); d_dc_colors_ = nullptr; }
     scene_splat_capacity_ = 0;
     scene_num_splats_ = 0;
+    gaussians_ptr_ = nullptr;
+}
+
+bool Rasterizer::ensureHostBuffers(int num_splats) {
+    // Ensure host vectors have capacity but don't reallocate if sufficient
+    if (static_cast<int>(host_buffer_capacity_) < num_splats) {
+        // Allocate with some margin to avoid repeated reallocations
+        size_t new_capacity = static_cast<size_t>(num_splats) * 1.1 + 1000;
+        h_means2D_.reserve(new_capacity * 2);
+        h_conic3D_.reserve(new_capacity * 3);
+        h_opacities_.reserve(new_capacity);
+        h_gaussian_ids_.reserve(new_capacity);
+        host_buffer_capacity_ = new_capacity;
+    }
+    // Resize to actual count (but capacity won't shrink)
+    h_means2D_.resize(num_splats * 2);
+    h_conic3D_.resize(num_splats * 3);
+    h_opacities_.resize(num_splats);
+    h_gaussian_ids_.resize(num_splats);
+    return true;
 }
 
 bool Rasterizer::ensureTileBuffers(size_t splat_list_count, size_t offsets_count) {
@@ -336,6 +380,9 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
         fprintf(stderr, "Error: No gaussians to upload\n");
         return false;
     }
+
+    // Save reference for render-time lookup
+    gaussians_ptr_ = &gaussians;
 
     printf("📤 Uploading scene data (%d gaussians) to GPU...\n", num);
     printf("  [DEBUG] sizeof(glm::vec3) = %zu bytes\n", sizeof(glm::vec3));
@@ -416,6 +463,11 @@ bool Rasterizer::render_cuda(
         return false;
     }
 
+    if (!gaussians_ptr_) {
+        fprintf(stderr, "Error: Scene data not uploaded. Call uploadSceneData() first.\n");
+        return false;
+    }
+
     printf("🚀 CUDA V2 Tile-based Render: %d splats, %dx%d image\n", num_splats, width, height);
 
     double t_sh_ms = 0.0;
@@ -424,25 +476,21 @@ bool Rasterizer::render_cuda(
     double t_d2h_ms = 0.0;
     float gpu_total_ms = 0.0f;
 
-    // Allocate device buffers
-    if (!allocateBuffers(num_splats, width, height)) {
-        fprintf(stderr, "❌ Failed to allocate CUDA buffers\n");
+    // Ensure frame buffers have capacity (realloc only if needed)
+    if (!ensureFrameBuffers(num_splats, width, height)) {
+        fprintf(stderr, "❌ Failed to ensure frame buffers\n");
         return false;
     }
 
-    // Prepare host arrays for upload (convert ScreenSplat to SoA format, skip colors—GPU will compute)
-    printf("🔄 Preparing %d splats for upload (colors will be computed on GPU)...\n", num_splats);
+    // Prepare host arrays for upload (convert ScreenSplat to SoA format)
+    printf("🔄 Preparing %d splats for upload...\n", num_splats);
     fflush(stdout);
     
-    std::vector<float> h_means2D(num_splats * 2);
-    std::vector<float> h_conic3D(num_splats * 3);
-    std::vector<float> h_colors(num_splats * 3);  // Will be filled by GPU kernel
-    std::vector<float> h_opacities(num_splats);
-    
-    // Pack per-splat scene data (position, DC, SH) in screen_splats order for GPU
-    std::vector<float> h_pos_ws_render(num_splats * 3);
-    std::vector<float> h_dc_colors_render(num_splats * 3);
-    std::vector<float> h_sh_coeffs_render(num_splats * 27);
+    // Reuse persistent host buffers (no malloc/free per frame)
+    if (!ensureHostBuffers(num_splats)) {
+        fprintf(stderr, "❌ Failed to ensure host buffers\n");
+        return false;
+    }
 
     {
         ScopedTimer timer("pack_screen_data", &t_sh_ms);
@@ -459,38 +507,22 @@ bool Rasterizer::render_cuda(
                 return false;
             }
             
-            h_means2D[i * 2 + 0] = sp.sx;
-            h_means2D[i * 2 + 1] = sp.sy;
+            h_means2D_[i * 2 + 0] = sp.sx;
+            h_means2D_[i * 2 + 1] = sp.sy;
             
-            h_conic3D[i * 3 + 0] = sp.cov_inv[0][0];
-            h_conic3D[i * 3 + 1] = sp.cov_inv[0][1];
-            h_conic3D[i * 3 + 2] = sp.cov_inv[1][1];
+            h_conic3D_[i * 3 + 0] = sp.cov_inv[0][0];
+            h_conic3D_[i * 3 + 1] = sp.cov_inv[0][1];
+            h_conic3D_[i * 3 + 2] = sp.cov_inv[1][1];
             
-            h_opacities[i] = sp.src->opacity;
+            h_opacities_[i] = sp.src->opacity;
             
-            // Pack scene data in render order (following screen_splats order)
-            const gs::GaussianSplat* g = sp.src;
-            h_pos_ws_render[i * 3 + 0] = g->position_ws.x;
-            h_pos_ws_render[i * 3 + 1] = g->position_ws.y;
-            h_pos_ws_render[i * 3 + 2] = g->position_ws.z;
+            // Use cached gaussian_id from ScreenSplat projection
+            // Already assigned in cpu_rasterizer.cpp during projection
+            h_gaussian_ids_[i] = sp.gaussian_id;
             
-            h_dc_colors_render[i * 3 + 0] = g->dc_color.r;
-            h_dc_colors_render[i * 3 + 1] = g->dc_color.g;
-            h_dc_colors_render[i * 3 + 2] = g->dc_color.b;
-            
-            // Pack SH coefficients
-            int original_n_basis = static_cast<int>(g->sh_color.coeffs.size()) / 3;
-            int used_basis = std::min(original_n_basis, 9);
-            for (int b = 0; b < 9; ++b) {
-                if (b < used_basis) {
-                    h_sh_coeffs_render[i * 27 + 0 * 9 + b] = g->sh_color.coeffs[0 * original_n_basis + b]; // R
-                    h_sh_coeffs_render[i * 27 + 1 * 9 + b] = g->sh_color.coeffs[1 * original_n_basis + b]; // G
-                    h_sh_coeffs_render[i * 27 + 2 * 9 + b] = g->sh_color.coeffs[2 * original_n_basis + b]; // B
-                } else {
-                    h_sh_coeffs_render[i * 27 + 0 * 9 + b] = 0.0f;
-                    h_sh_coeffs_render[i * 27 + 1 * 9 + b] = 0.0f;
-                    h_sh_coeffs_render[i * 27 + 2 * 9 + b] = 0.0f;
-                }
+            if (sp.gaussian_id < 0) {
+                fprintf(stderr, "Error: gaussian_id not set in splat %d\n", i);
+                return false;
             }
         }
     }
@@ -498,23 +530,26 @@ bool Rasterizer::render_cuda(
     printf("✅ Screen data packed. Computing SH colors on GPU...\n");
     fflush(stdout);
 
-    // Allocate temporary device buffers for render-order scene data
-    float* d_pos_ws_render = nullptr;
-    float* d_dc_colors_render = nullptr;
-    float* d_sh_coeffs_render = nullptr;
-    
-    CUDA_CHECK(cudaMalloc(&d_pos_ws_render, num_splats * 3 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dc_colors_render, num_splats * 3 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sh_coeffs_render, num_splats * 27 * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_pos_ws_render, h_pos_ws_render.data(), 
-                         num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_dc_colors_render, h_dc_colors_render.data(), 
-                         num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_sh_coeffs_render, h_sh_coeffs_render.data(), 
-                         num_splats * 27 * sizeof(float), cudaMemcpyHostToDevice));
+    // Upload data to GPU
+    printf("📤 Uploading data to GPU...\n");
+    fflush(stdout);
 
-    // Launch GPU SH evaluation kernel (evaluates colors for all splats used in this render)
+    {
+        ScopedTimer timer("upload_h2d", &t_h2d_ms);
+        CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D_.data(), 
+                             num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D_.data(), 
+                             num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities_.data(), 
+                             num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_gaussian_ids_, h_gaussian_ids_.data(),
+                             num_splats * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    printf("✅ Uploaded data to GPU\n");
+    fflush(stdout);
+
+    // Launch GPU SH evaluation kernel
     {
         ScopedTimer timer("gpu_sh_eval", &t_sh_ms);
         dim3 block(256);
@@ -524,9 +559,10 @@ bool Rasterizer::render_cuda(
                grid.x, block.x, num_splats);
         
         evalSHColorKernel<<<grid, block>>>(
-            d_pos_ws_render,
-            d_dc_colors_render,
-            d_sh_coeffs_render,
+            d_gaussian_ids_,
+            d_pos_ws_,
+            d_dc_colors_,
+            d_sh_coeffs_,
             camera_pos.x, camera_pos.y, camera_pos.z,
             num_splats,
             d_colors_
@@ -538,14 +574,8 @@ bool Rasterizer::render_cuda(
             return false;
         }
         
-        // Synchronize to ensure kernel completes
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA kernel execution error: %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        
-        printf("  ✓ evalSHColorKernel completed successfully\n");
+        // D2H copy will implicitly synchronize; no explicit sync needed here
+        printf("  ✓ evalSHColorKernel enqueued (will sync via D2H copy)\n");
         fflush(stdout);
     }
 
@@ -623,36 +653,18 @@ bool Rasterizer::render_cuda(
            h_tile_splat_indices.size(), num_tiles);
     fflush(stdout);
 
-    // Allocate device memory for tile lists
     // Ensure tile buffers have capacity and upload
     if (!ensureTileBuffers(h_tile_splat_indices.size(), (size_t)(num_tiles + 1))) {
         fprintf(stderr, "Failed to ensure tile buffer capacity\n");
         return false;
     }
 
-    // Upload data to GPU (note: d_colors_ is filled by GPU kernel, not uploaded here)
-    printf("📤 Uploading data to GPU...\n");
-    fflush(stdout);
+    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(),
+                         h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(),
+                         (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
-    {
-        ScopedTimer timer("upload_h2d", &t_h2d_ms);
-        CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), 
-                             num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), 
-                             num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-        // d_colors_ is filled by GPU kernel, not uploaded here
-        CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), 
-                             num_splats * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(),
-                             h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(),
-                             (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
-    }
-
-    printf("✅ Uploaded data to GPU\n");
-    fflush(stdout);
-
-    // Launch kernel
+    // Launch tile-based rendering kernel
     dim3 block(16, 16);
     dim3 grid(num_tiles_x, num_tiles_y);
 
@@ -691,11 +703,6 @@ bool Rasterizer::render_cuda(
 
     // Stop timer after copy (implies kernel completion)
     kernel_timer.stop();
-    
-    // Free temporary render-order buffers
-    cudaFree(d_pos_ws_render);
-    cudaFree(d_dc_colors_render);
-    cudaFree(d_sh_coeffs_render);
 
 #if ENABLE_PROFILING
     double cpu_total_ms = t_sh_ms + t_tile_ms + t_h2d_ms + t_d2h_ms;
@@ -724,68 +731,44 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         return false;
     }
 
-    // Allocate buffers and prepare SoA like in render_cuda
-    if (!allocateBuffers(num_splats, width, height)) return false;
+    if (!gaussians_ptr_) {
+        fprintf(stderr, "Error: Scene data not uploaded. Call uploadSceneData() first.\n");
+        return false;
+    }
 
-    std::vector<float> h_means2D(num_splats * 2);
-    std::vector<float> h_conic3D(num_splats * 3);
-    std::vector<float> h_colors(num_splats * 3);  // Will be filled by GPU kernel
-    std::vector<float> h_opacities(num_splats);
-    
-    // Pack scene data in screen_splats order
-    std::vector<float> h_pos_ws_render(num_splats * 3);
-    std::vector<float> h_dc_colors_render(num_splats * 3);
-    std::vector<float> h_sh_coeffs_render(num_splats * 27);
+    // Ensure frame buffers have capacity (realloc only if needed)
+    if (!ensureFrameBuffers(num_splats, width, height)) return false;
+
+    // Reuse persistent host buffers
+    if (!ensureHostBuffers(num_splats)) return false;
 
     for (int i = 0; i < num_splats; ++i) {
         const gs::ScreenSplat& sp = screen_splats[i];
         if (!sp.src) { fprintf(stderr, "Null src at %d\n", i); return false; }
-        const gs::GaussianSplat* g = sp.src;
         
-        h_means2D[i * 2 + 0] = sp.sx;
-        h_means2D[i * 2 + 1] = sp.sy;
-        h_conic3D[i * 3 + 0] = sp.cov_inv[0][0];
-        h_conic3D[i * 3 + 1] = sp.cov_inv[0][1];
-        h_conic3D[i * 3 + 2] = sp.cov_inv[1][1];
-        h_opacities[i] = g->opacity;
+        h_means2D_[i * 2 + 0] = sp.sx;
+        h_means2D_[i * 2 + 1] = sp.sy;
+        h_conic3D_[i * 3 + 0] = sp.cov_inv[0][0];
+        h_conic3D_[i * 3 + 1] = sp.cov_inv[0][1];
+        h_conic3D_[i * 3 + 2] = sp.cov_inv[1][1];
+        h_opacities_[i] = sp.src->opacity;
         
-        // Pack position
-        h_pos_ws_render[i*3+0] = g->position_ws.x;
-        h_pos_ws_render[i*3+1] = g->position_ws.y;
-        h_pos_ws_render[i*3+2] = g->position_ws.z;
+        // Use cached gaussian_id from ScreenSplat projection
+        h_gaussian_ids_[i] = sp.gaussian_id;
         
-        // Pack DC color
-        h_dc_colors_render[i*3+0] = g->dc_color.r;
-        h_dc_colors_render[i*3+1] = g->dc_color.g;
-        h_dc_colors_render[i*3+2] = g->dc_color.b;
-        
-        // Pack SH coefficients (9 basis, 3 channels)
-        int original_n_basis = (int)g->sh_color.coeffs.size() / 3;
-        for (int channel = 0; channel < 3; ++channel) {
-            for (int b = 0; b < 9; ++b) {
-                if (b < original_n_basis) {
-                    h_sh_coeffs_render[i*27 + channel*9 + b] = g->sh_color.coeffs[channel * original_n_basis + b];
-                } else {
-                    h_sh_coeffs_render[i*27 + channel*9 + b] = 0.0f;
-                }
-            }
+        if (sp.gaussian_id < 0) {
+            fprintf(stderr, "Error: gaussian_id not set in splat %d\n", i);
+            return false;
         }
     }
 
-    // Upload render-order data to temporary device buffers
-    float* d_pos_ws_render = nullptr;
-    float* d_dc_colors_render = nullptr;
-    float* d_sh_coeffs_render = nullptr;
-    
-    cudaMalloc(&d_pos_ws_render, num_splats * 3 * sizeof(float));
-    cudaMalloc(&d_dc_colors_render, num_splats * 3 * sizeof(float));
-    cudaMalloc(&d_sh_coeffs_render, num_splats * 27 * sizeof(float));
-    
-    cudaMemcpy(d_pos_ws_render, h_pos_ws_render.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dc_colors_render, h_dc_colors_render.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sh_coeffs_render, h_sh_coeffs_render.data(), num_splats * 27 * sizeof(float), cudaMemcpyHostToDevice);
+    // Upload to GPU
+    CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D_.data(), num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D_.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities_.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_gaussian_ids_, h_gaussian_ids_.data(), num_splats * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Launch GPU SH evaluation kernel with render-order buffers
+    // Launch GPU SH evaluation kernel
     {
         dim3 block(256);
         dim3 grid((num_splats + 255) / 256);
@@ -794,9 +777,10 @@ bool Rasterizer::render_cuda_to_rgba8_device(
                grid.x, block.x, num_splats);
         
         evalSHColorKernel<<<grid, block>>>(
-            d_pos_ws_render,
-            d_dc_colors_render,
-            d_sh_coeffs_render,
+            d_gaussian_ids_,
+            d_pos_ws_,
+            d_dc_colors_,
+            d_sh_coeffs_,
             camera_pos.x, camera_pos.y, camera_pos.z,
             num_splats,
             d_colors_
@@ -804,23 +788,11 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA kernel launch error (PBO): %s\n", cudaGetErrorString(err));
-            cudaFree(d_pos_ws_render);
-            cudaFree(d_dc_colors_render);
-            cudaFree(d_sh_coeffs_render);
             return false;
         }
         
-        // Synchronize to ensure kernel completes
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA kernel execution error (PBO): %s\n", cudaGetErrorString(err));
-            cudaFree(d_pos_ws_render);
-            cudaFree(d_dc_colors_render);
-            cudaFree(d_sh_coeffs_render);
-            return false;
-        }
-        
-        printf("  ✓ [PBO] evalSHColorKernel completed\n");
+        // Stream ordering ensures kernel before tile kernel; OpenGL unmap provides fence
+        printf("  ✓ [PBO] evalSHColorKernel enqueued (stream-ordered execution)\n");
         fflush(stdout);
     }
 
@@ -868,10 +840,6 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         fprintf(stderr, "Failed to ensure tile buffer capacity\n");
         return false;
     }
-    // Note: d_colors_ is filled by GPU kernel, not uploaded here
-    CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D.data(), num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(), h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(), (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
@@ -889,11 +857,6 @@ bool Rasterizer::render_cuda_to_rgba8_device(
     dim3 p(16, 16);
     dim3 g((width + 15)/16, (height + 15)/16);
     packToRGBA8<<<g, p>>>(d_output_, out_rgba8_device, width, height);
-
-    // Clean up temporary render-order buffers
-    cudaFree(d_pos_ws_render);
-    cudaFree(d_dc_colors_render);
-    cudaFree(d_sh_coeffs_render);
 
     return true;
 }

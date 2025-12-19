@@ -75,11 +75,11 @@ public:
 
 private:
     // Device memory pointers (allocated dynamically per render call)
-    float* d_means2D_;      // Screen positions [N*2]: (sx, sy)
-    float* d_conic3D_;      // 2D conic matrices [N*3]: (a, b, c) where conic = [a b; b c]
-    float* d_colors_;       // RGB colors [N*3]
-    float* d_opacities_;    // Opacity values [N]
-    float* d_output_;       // Output image [W*H*3]
+    float* d_means2D_ = nullptr;        // Screen positions [N*2]: (sx, sy)
+    float* d_conic3D_ = nullptr;        // 2D conic matrices [N*3]: (a, b, c) where conic = [a b; b c]
+    float* d_colors_ = nullptr;         // RGB colors [N*3]
+    float* d_opacities_ = nullptr;      // Opacity values [N]
+    float* d_output_ = nullptr;         // Output image [W*H*3]
 
     // Scene-static data (uploaded once, kept resident across frames)
     float* d_pos_ws_ = nullptr;         // World positions [N*3]: (x,y,z) interleaved
@@ -94,12 +94,27 @@ private:
     size_t tile_splat_list_capacity_ = 0; // number of ints allocated
     size_t tile_offsets_capacity_ = 0;     // number of ints allocated
 
+    // Per-frame buffers (capacity-managed device)
+    int* d_gaussian_ids_ = nullptr;     // gaussian index for each screen splat [N]
+    size_t frame_buffer_capacity_ = 0;  // capacity of d_means2D_, d_conic3D_, d_colors_, d_opacities_, d_gaussian_ids_
+
+    // Persistent host buffers (reused each frame, no realloc)
+    std::vector<float> h_means2D_;       // [N*2] screen positions
+    std::vector<float> h_conic3D_;       // [N*3] conic matrices
+    std::vector<float> h_opacities_;     // [N] opacity values
+    std::vector<int> h_gaussian_ids_;    // [N] gaussian indices
+    size_t host_buffer_capacity_ = 0;    // tracked capacity to avoid reallocs
+
     int num_splats_;
     int width_, height_;
 
+    // Scene reference (saved from uploadSceneData)
+    const std::vector<gs::GaussianSplat>* gaussians_ptr_ = nullptr;
+
     // Internal memory management
-    bool allocateBuffers(int num_splats, int width, int height);
-    void freeBuffers();
+    bool ensureFrameBuffers(int num_splats, int width, int height);
+    void freeFrameBuffers();
+    bool ensureHostBuffers(int num_splats);  // Reuse persistent host vectors
     
     // Ensure tile buffers have enough capacity; realloc only when needed
     bool ensureTileBuffers(size_t splat_list_count, size_t offsets_count);
