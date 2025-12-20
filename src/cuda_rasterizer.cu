@@ -1175,8 +1175,8 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         dim3 block(256);
         dim3 grid((num_splats + 255) / 256);
         
-        printf("  [PBO] Launching evalSHColorKernel: grid=(%u, 1, 1), block=(%u, 1, 1), num_splats=%d\n",
-               grid.x, block.x, num_splats);
+        // printf("  [PBO] Launching evalSHColorKernel: grid=(%u, 1, 1), block=(%u, 1, 1), num_splats=%d\n",
+        //        grid.x, block.x, num_splats);
         
         evalSHColorKernel<<<grid, block>>>(
             d_gaussian_ids_,
@@ -1194,8 +1194,8 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         }
         
         // Stream ordering ensures kernel before tile kernel; OpenGL unmap provides fence
-        printf("  ✓ [PBO] evalSHColorKernel enqueued (stream-ordered execution)\n");
-        fflush(stdout);
+        // printf("  ✓ [PBO] evalSHColorKernel enqueued (stream-ordered execution)\n");
+        // fflush(stdout);
     }
 
     int num_tiles_x = (width + 15) / 16;

@@ -38,8 +38,8 @@ public:
      * Process mouse movement (delta in pixels)
      */
     void processMouse(float dx, float dy) {
-        yaw_deg_ += dx * mouse_sensitivity_;
-        pitch_deg_ -= dy * mouse_sensitivity_;
+        yaw_deg_ -= dx * mouse_sensitivity_;
+        pitch_deg_ += dy * mouse_sensitivity_;
 
         // Clamp pitch to avoid gimbal lock
         if (pitch_deg_ > 89.0f) pitch_deg_ = 89.0f;
@@ -58,13 +58,13 @@ public:
      */
     void processKeyboard(float forward, float back, float left, float right, 
                         float up, float down, float delta_time, bool fast = false) {
-        float speed = move_speed_ * (fast ? 2.0f : 1.0f) * delta_time;
+        float speed = move_speed_ * (fast ? 0.5f : 0.05f) * delta_time;
 
         glm::vec3 move(0.0f);
         if (forward > 0.5f) move += front_;
         if (back > 0.5f) move -= front_;
-        if (left > 0.5f) move -= right_;
-        if (right > 0.5f) move += right_;
+        if (left > 0.5f) move += right_;
+        if (right > 0.5f) move -= right_;
         if (up > 0.5f) move += glm::vec3(0.0f, 1.0f, 0.0f);
         if (down > 0.5f) move -= glm::vec3(0.0f, 1.0f, 0.0f);
 

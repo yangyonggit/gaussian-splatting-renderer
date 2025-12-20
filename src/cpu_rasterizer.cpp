@@ -107,7 +107,7 @@ bool Rasterizer::projectSplats(
         out_projected.push_back(sp);
     }
 
-    std::cout << "Projected " << out_projected.size() << " visible splats.\n";
+    // std::cout << "Projected " << out_projected.size() << " visible splats.\n";
     return true;
 }
 
@@ -116,7 +116,7 @@ void Rasterizer::sortByDepth(std::vector<gs::ScreenSplat>& splats) {
         [](const gs::ScreenSplat& a, const gs::ScreenSplat& b) {
             return a.depth > b.depth;
         });
-    std::cout << "Sorted " << splats.size() << " splats by depth (back-to-front).\n";
+    // std::cout << "Sorted " << splats.size() << " splats by depth (back-to-front).\n";
 }
 
 bool Rasterizer::rasterize(
