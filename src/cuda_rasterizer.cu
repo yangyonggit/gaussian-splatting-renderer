@@ -352,21 +352,27 @@ __global__ void packToRGBA8(const float* __restrict__ src_rgb,
 
 // Evaluate 9 real SH basis functions (up to l = 2)
 // Matches CPU-side evalSH9 from sh_color.cpp
-__device__ inline void evalSH9_device(const glm::vec3& dir, float* sh)
+__device__ __forceinline__ void evalSH9_device(const glm::vec3& dir, float* sh)
 {
-    float x = dir.x;
-    float y = dir.y;
-    float z = dir.z;
+    const float x = dir.x;
+    const float y = dir.y;
+    const float z = dir.z;
 
-    sh[0] = 0.28209479177387814f;
-    sh[1] = -0.4886025119029199f * y;
-    sh[2] =  0.4886025119029199f * z;
-    sh[3] = -0.4886025119029199f * x;
-    sh[4] =  1.0925484305920792f * x * y;
-    sh[5] = -1.0925484305920792f * y * z;
-    sh[6] =  0.31539156525252005f * (3.0f * z * z - 1.0f);
-    sh[7] = -1.0925484305920792f * x * z;
-    sh[8] =  0.5462742152960396f * (x * x - y * y);
+    constexpr float c0 = 0.28209479177387814f;
+    constexpr float c1 = 0.4886025119029199f;
+    constexpr float c2 = 1.0925484305920792f;
+    constexpr float c3 = 0.31539156525252005f;
+    constexpr float c4 = 0.5462742152960396f;
+
+    sh[0] = c0;
+    sh[1] = -c1 * y;
+    sh[2] =  c1 * z;
+    sh[3] = -c1 * x;
+    sh[4] =  c2 * x * y;
+    sh[5] = -c2 * y * z;
+    sh[6] =  c3 * (3.0f * z * z - 1.0f);
+    sh[7] = -c2 * x * z;
+    sh[8] =  c4 * (x * x - y * y);
 }
 
 // Evaluate SH color for all splats given camera position
@@ -397,25 +403,14 @@ __global__ void evalSHColorKernel(
     
     // Normalize view direction
     float len_sq = view_x * view_x + view_y * view_y + view_z * view_z;
-    float len = sqrtf(len_sq);
-    if (len < 1e-6f) len = 1e-6f;
-    float inv_len = 1.0f / len;
+    float inv_len = rsqrtf(len_sq + 1e-8f);
     view_x *= inv_len;
     view_y *= inv_len;
     view_z *= inv_len;
 
     // Evaluate SH basis functions with float view direction (l≤2, 9 basis)
     float sh[9];
-    float x = view_x, y = view_y, z = view_z;
-    sh[0] = 0.28209479177387814f;
-    sh[1] = -0.4886025119029199f * y;
-    sh[2] =  0.4886025119029199f * z;
-    sh[3] = -0.4886025119029199f * x;
-    sh[4] =  1.0925484305920792f * x * y;
-    sh[5] = -1.0925484305920792f * y * z;
-    sh[6] =  0.31539156525252005f * (3.0f * z * z - 1.0f);
-    sh[7] = -1.0925484305920792f * x * z;
-    sh[8] =  0.5462742152960396f * (x * x - y * y);
+    evalSH9_device(glm::vec3(view_x, view_y, view_z), sh);
 
     // Start with DC color
     float r = dc_colors[gid * 3 + 0];
