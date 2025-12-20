@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 #include <vector>
+#include <cstdint>
 
 // Forward declaration to avoid including gaussian.h in header
 namespace gs {
@@ -79,6 +80,8 @@ private:
     float* d_conic3D_ = nullptr;        // 2D conic matrices [N*3]: (a, b, c) where conic = [a b; b c]
     float* d_colors_ = nullptr;         // RGB colors [N*3]
     float* d_opacities_ = nullptr;      // Opacity values [N]
+    float* d_radii_px_ = nullptr;       // Conservative radius in pixels [N]
+    float* d_depths_ = nullptr;         // Depth values for sorting [N]
     float* d_output_ = nullptr;         // Output image [W*H*3]
 
     // Scene-static data (uploaded once, kept resident across frames)
@@ -89,10 +92,28 @@ private:
     size_t scene_num_splats_ = 0;       // Number of splats currently loaded
 
     // Cached tile buffers (capacity-managed)
-    int* d_tile_splat_list_ = nullptr; // flat list of indices
-    int* d_tile_offsets_ = nullptr;    // tile offsets (num_tiles+1)
-    size_t tile_splat_list_capacity_ = 0; // number of ints allocated
-    size_t tile_offsets_capacity_ = 0;     // number of ints allocated
+    int* d_tile_splat_list_ = nullptr;  // flat list of splat indices (sorted)
+    int* d_tile_offsets_ = nullptr;     // tile offsets (num_tiles+1)
+    size_t tile_splat_list_capacity_ = 0;
+    size_t tile_offsets_capacity_ = 0;
+
+    // GPU tile binning & sorting buffers (capacity-managed)
+    int* d_num_tiles_touched_ = nullptr;     // [N] count of tiles per splat
+    int* d_dup_offsets_ = nullptr;           // [N+1] exclusive scan of num_tiles_touched
+    uint64_t* d_keys_ = nullptr;             // [total_dup] sort keys (tile_id, depth)
+    uint64_t* d_keys_sorted_ = nullptr;      // [total_dup] sorted keys
+    int* d_values_ = nullptr;                // [total_dup] splat indices
+    int* d_values_sorted_ = nullptr;         // [total_dup] sorted splat indices
+    uint32_t* d_tile_ids_sorted_ = nullptr;  // [total_dup] tile ids extracted from sorted keys
+    uint32_t* d_unique_tile_ids_ = nullptr;  // [num_runs] unique tile ids after RLE
+    int* d_run_lengths_ = nullptr;           // [num_runs] run lengths from RLE
+    int* d_run_offsets_ = nullptr;           // [num_runs] exclusive scan of run lengths
+    int* d_num_runs_device_ = nullptr;       // single int on device holding num_runs
+    void* d_cub_temp_ = nullptr;             // CUB temporary storage
+    size_t sort_buffer_capacity_ = 0;        // capacity for sort arrays
+    size_t run_buffer_capacity_ = 0;         // capacity for RLE buffers (>= total_dup)
+    size_t per_splat_capacity_ = 0;          // capacity for per-splat count/offset buffers
+    size_t cub_temp_bytes_ = 0;              // CUB temp storage size
 
     // Per-frame buffers (capacity-managed device)
     int* d_gaussian_ids_ = nullptr;     // gaussian index for each screen splat [N]
@@ -102,6 +123,8 @@ private:
     std::vector<float> h_means2D_;       // [N*2] screen positions
     std::vector<float> h_conic3D_;       // [N*3] conic matrices
     std::vector<float> h_opacities_;     // [N] opacity values
+    std::vector<float> h_radii_px_;      // [N] radius values
+    std::vector<float> h_depths_;        // [N] depth values
     std::vector<int> h_gaussian_ids_;    // [N] gaussian indices
     size_t host_buffer_capacity_ = 0;    // tracked capacity to avoid reallocs
 
@@ -115,9 +138,10 @@ private:
     bool ensureFrameBuffers(int num_splats, int width, int height);
     void freeFrameBuffers();
     bool ensureHostBuffers(int num_splats);  // Reuse persistent host vectors
-    
-    // Ensure tile buffers have enough capacity; realloc only when needed
     bool ensureTileBuffers(size_t splat_list_count, size_t offsets_count);
+    bool ensureSortBuffers(int num_splats, size_t total_duplicates); // GPU sort + RLE buffers
+    bool buildTileBinning(int num_splats, int num_tiles_x, int num_tiles_y, int num_tiles, size_t& total_duplicates);
+    bool debugValidateTileOffsets(int num_tiles, size_t total_duplicates);
 };
 
 } // namespace CudaRasterizer

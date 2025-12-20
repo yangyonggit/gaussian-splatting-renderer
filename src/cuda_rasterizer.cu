@@ -6,7 +6,13 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
+#include <cstring>
+#include <cmath>
+#include <limits>
 #include <glm/glm.hpp>
+#include <cub/device/device_scan.cuh>
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_run_length_encode.cuh>
 
 // CUDA error checking macros
 #define CUDA_CHECK(call) \
@@ -29,7 +35,186 @@
         } \
     } while (0)
 
+#if defined(ENABLE_PROFILING) || !defined(NDEBUG)
+#define CUDA_DEBUG_SYNC() CUDA_CHECK(cudaDeviceSynchronize())
+#else
+#define CUDA_DEBUG_SYNC()
+#endif
+
 namespace CudaRasterizer {
+
+// ============================================================
+// Utility Functions: Float-to-Ordered-Uint Conversion
+// ============================================================
+
+// Device/host float to ordered uint32 (radix-sortable, IEEE order preserved)
+__device__ inline uint32_t floatToOrderedUintDevice(float f) {
+    uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
+}
+
+__host__ inline uint32_t floatToOrderedUintHost(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(uint32_t));
+    return (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
+}
+
+__device__ __host__ inline uint32_t floatToOrderedUint(float f) {
+#ifdef __CUDA_ARCH__
+    return floatToOrderedUintDevice(f);
+#else
+    return floatToOrderedUintHost(f);
+#endif
+}
+
+__device__ __host__ inline float sanitizeDepth(float depth) {
+#ifdef __CUDA_ARCH__
+    return isnan(depth) ? __int_as_float(0x7f800000) : depth; // +inf on device
+#else
+    return std::isnan(depth) ? std::numeric_limits<float>::infinity() : depth;
+#endif
+}
+
+/**
+ * Pack (tile_id, depth_descending) into 64-bit sort key.
+ * Depth is assumed to be view-space or camera-space depth where larger means farther.
+ * NaN is pushed to the far plane to keep keys ordered.
+ */
+__device__ inline uint64_t packTileDepthKey(uint32_t tile_id, float depth) {
+    float depth_sanitized = sanitizeDepth(depth);
+    uint32_t depth_ordered = floatToOrderedUint(depth_sanitized);
+    uint32_t depth_desc = 0xFFFFFFFFu - depth_ordered;  // Descending = farther first
+    return (uint64_t(tile_id) << 32) | uint64_t(depth_desc);
+}
+
+// ============================================================
+// CUDA Kernels: GPU Tile Binning & Sorting
+// ============================================================
+
+/**
+ * Phase 1: Compute how many tiles each splat touches
+ * Output: num_tiles_touched[idx] = count of tiles covered by splat idx
+ */
+__global__ void computeTileTouchCountKernel(
+    const float* __restrict__ means2D,      // [N*2] screen positions
+    const float* __restrict__ radii_px,     // [N] conservative radius
+    int num_splats,
+    int num_tiles_x,
+    int num_tiles_y,
+    int* __restrict__ num_tiles_touched     // [N] output counts
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_splats) return;
+
+    float sx = means2D[idx * 2 + 0];
+    float sy = means2D[idx * 2 + 1];
+    float radius = radii_px[idx];
+
+    // Compute tile bounding box
+    int tile_x_min = max(0, (int)((sx - radius) / 16.0f));
+    int tile_x_max = min(num_tiles_x - 1, (int)((sx + radius) / 16.0f));
+    int tile_y_min = max(0, (int)((sy - radius) / 16.0f));
+    int tile_y_max = min(num_tiles_y - 1, (int)((sy + radius) / 16.0f));
+
+    // Clamp to valid range (safety)
+    if (tile_x_max < tile_x_min || tile_y_max < tile_y_min) {
+        num_tiles_touched[idx] = 0;
+        return;
+    }
+
+    int count = (tile_x_max - tile_x_min + 1) * (tile_y_max - tile_y_min + 1);
+    num_tiles_touched[idx] = count;
+}
+
+/**
+ * Phase 2: Emit duplicate keys/values for each splat-tile pair
+ * Each splat writes (tile_id, depth) keys and (splat_idx) values
+ * Output arrays are indexed by dup_offsets[idx] + local_offset
+ */
+__global__ void emitDuplicateKeysKernel(
+    const float* __restrict__ means2D,
+    const float* __restrict__ radii_px,
+    const float* __restrict__ depths,       // [N] depth values for sorting
+    int num_splats,
+    int num_tiles_x,
+    int num_tiles_y,
+    const int* __restrict__ dup_offsets,    // [N] exclusive scan of num_tiles_touched
+    uint64_t* __restrict__ out_keys,        // [total_duplicates]
+    int* __restrict__ out_values            // [total_duplicates]
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_splats) return;
+
+    float sx = means2D[idx * 2 + 0];
+    float sy = means2D[idx * 2 + 1];
+    float radius = radii_px[idx];
+    float depth = depths[idx];
+
+    int tile_x_min = max(0, (int)((sx - radius) / 16.0f));
+    int tile_x_max = min(num_tiles_x - 1, (int)((sx + radius) / 16.0f));
+    int tile_y_min = max(0, (int)((sy - radius) / 16.0f));
+    int tile_y_max = min(num_tiles_y - 1, (int)((sy + radius) / 16.0f));
+
+    if (tile_x_max < tile_x_min || tile_y_max < tile_y_min) return;
+
+    int write_base = dup_offsets[idx];
+    int local_k = 0;
+
+    // Emit one entry per touched tile
+    for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
+        for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
+            int tile_id = ty * num_tiles_x + tx;
+            uint64_t key = packTileDepthKey(tile_id, depth);
+            
+            out_keys[write_base + local_k] = key;
+            out_values[write_base + local_k] = idx;
+            ++local_k;
+        }
+    }
+}
+
+// Extract high-32-bit tile ids from sorted keys
+__global__ void extractTileIdsKernel(const uint64_t* __restrict__ sorted_keys,
+                                     uint32_t* __restrict__ tile_ids,
+                                     int total_duplicates) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_duplicates) {
+        tile_ids[idx] = static_cast<uint32_t>(sorted_keys[idx] >> 32);
+    }
+}
+
+// Scatter run offsets to tile_offsets for tiles that appear
+__global__ void scatterTileOffsetsKernel(const uint32_t* __restrict__ unique_tile_ids,
+                                         const int* __restrict__ run_offsets,
+                                         int num_runs,
+                                         int* __restrict__ tile_offsets) {
+    int run = blockIdx.x * blockDim.x + threadIdx.x;
+    if (run < num_runs) {
+        uint32_t tile = unique_tile_ids[run];
+        tile_offsets[tile] = run_offsets[run];
+    }
+}
+
+// Set the sentinel tail offset
+__global__ void setTileOffsetsTailKernel(int* tile_offsets, int num_tiles, int total_duplicates) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        tile_offsets[num_tiles] = total_duplicates;
+    }
+}
+
+// Fill gaps so that empty tiles get start=end of next valid tile
+__global__ void fillTileOffsetGapsKernel(int* tile_offsets, int num_tiles) {
+    // Serial backward sweep is acceptable: num_tiles is moderate (< few 10k)
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int t = num_tiles - 1; t >= 0; --t) {
+            int next = tile_offsets[t + 1];
+            int cur = tile_offsets[t];
+            if (cur < 0) {
+                tile_offsets[t] = next;
+            }
+        }
+    }
+}
 
 // ============================================================
 // CUDA Kernel: Naive Per-Pixel Gaussian Splatting
@@ -266,11 +451,22 @@ Rasterizer::Rasterizer()
     , d_conic3D_(nullptr)
     , d_colors_(nullptr)
     , d_opacities_(nullptr)
+    , d_radii_px_(nullptr)
+    , d_depths_(nullptr)
     , d_output_(nullptr)
     , d_tile_splat_list_(nullptr)
     , d_tile_offsets_(nullptr)
+    , d_num_tiles_touched_(nullptr)
+    , d_dup_offsets_(nullptr)
+    , d_keys_(nullptr)
+    , d_keys_sorted_(nullptr)
+    , d_values_(nullptr)
+    , d_values_sorted_(nullptr)
+    , d_cub_temp_(nullptr)
     , tile_splat_list_capacity_(0)
     , tile_offsets_capacity_(0)
+    , sort_buffer_capacity_(0)
+    , cub_temp_bytes_(0)
     , num_splats_(0)
     , width_(0)
     , height_(0)
@@ -298,6 +494,8 @@ bool Rasterizer::ensureFrameBuffers(int num_splats, int width, int height) {
     if (d_conic3D_) cudaFree(d_conic3D_);
     if (d_colors_) cudaFree(d_colors_);
     if (d_opacities_) cudaFree(d_opacities_);
+    if (d_radii_px_) cudaFree(d_radii_px_);
+    if (d_depths_) cudaFree(d_depths_);
     if (d_output_) cudaFree(d_output_);
     if (d_gaussian_ids_) cudaFree(d_gaussian_ids_);
 
@@ -305,6 +503,8 @@ bool Rasterizer::ensureFrameBuffers(int num_splats, int width, int height) {
     CUDA_CHECK(cudaMalloc(&d_conic3D_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_colors_, num_splats * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_opacities_, num_splats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_radii_px_, num_splats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_depths_, num_splats * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_output_, width * height * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_gaussian_ids_, num_splats * sizeof(int)));
 
@@ -317,16 +517,35 @@ void Rasterizer::freeFrameBuffers() {
     if (d_conic3D_) { cudaFree(d_conic3D_); d_conic3D_ = nullptr; }
     if (d_colors_) { cudaFree(d_colors_); d_colors_ = nullptr; }
     if (d_opacities_) { cudaFree(d_opacities_); d_opacities_ = nullptr; }
+    if (d_radii_px_) { cudaFree(d_radii_px_); d_radii_px_ = nullptr; }
+    if (d_depths_) { cudaFree(d_depths_); d_depths_ = nullptr; }
     if (d_output_) { cudaFree(d_output_); d_output_ = nullptr; }
     if (d_gaussian_ids_) { cudaFree(d_gaussian_ids_); d_gaussian_ids_ = nullptr; }
     if (d_tile_splat_list_) { cudaFree(d_tile_splat_list_); d_tile_splat_list_ = nullptr; tile_splat_list_capacity_ = 0; }
     if (d_tile_offsets_) { cudaFree(d_tile_offsets_); d_tile_offsets_ = nullptr; tile_offsets_capacity_ = 0; }
+    if (d_num_tiles_touched_) { cudaFree(d_num_tiles_touched_); d_num_tiles_touched_ = nullptr; }
+    if (d_dup_offsets_) { cudaFree(d_dup_offsets_); d_dup_offsets_ = nullptr; }
+    if (d_keys_) { cudaFree(d_keys_); d_keys_ = nullptr; }
+    if (d_keys_sorted_) { cudaFree(d_keys_sorted_); d_keys_sorted_ = nullptr; }
+    if (d_values_) { cudaFree(d_values_); d_values_ = nullptr; }
+    if (d_values_sorted_) { cudaFree(d_values_sorted_); d_values_sorted_ = nullptr; }
+    if (d_tile_ids_sorted_) { cudaFree(d_tile_ids_sorted_); d_tile_ids_sorted_ = nullptr; }
+    if (d_unique_tile_ids_) { cudaFree(d_unique_tile_ids_); d_unique_tile_ids_ = nullptr; }
+    if (d_run_lengths_) { cudaFree(d_run_lengths_); d_run_lengths_ = nullptr; }
+    if (d_run_offsets_) { cudaFree(d_run_offsets_); d_run_offsets_ = nullptr; }
+    if (d_num_runs_device_) { cudaFree(d_num_runs_device_); d_num_runs_device_ = nullptr; }
+    if (d_cub_temp_) { cudaFree(d_cub_temp_); d_cub_temp_ = nullptr; cub_temp_bytes_ = 0; }
     frame_buffer_capacity_ = 0;
+    sort_buffer_capacity_ = 0;
+    run_buffer_capacity_ = 0;
+    per_splat_capacity_ = 0;
     
     // Host buffers: shrink to zero but keep capacity
     h_means2D_.clear();
     h_conic3D_.clear();
     h_opacities_.clear();
+    h_radii_px_.clear();
+    h_depths_.clear();
     h_gaussian_ids_.clear();
 }
 
@@ -349,6 +568,8 @@ bool Rasterizer::ensureHostBuffers(int num_splats) {
         h_means2D_.reserve(new_capacity * 2);
         h_conic3D_.reserve(new_capacity * 3);
         h_opacities_.reserve(new_capacity);
+        h_radii_px_.reserve(new_capacity);
+        h_depths_.reserve(new_capacity);
         h_gaussian_ids_.reserve(new_capacity);
         host_buffer_capacity_ = new_capacity;
     }
@@ -356,6 +577,8 @@ bool Rasterizer::ensureHostBuffers(int num_splats) {
     h_means2D_.resize(num_splats * 2);
     h_conic3D_.resize(num_splats * 3);
     h_opacities_.resize(num_splats);
+    h_radii_px_.resize(num_splats);
+    h_depths_.resize(num_splats);
     h_gaussian_ids_.resize(num_splats);
     return true;
 }
@@ -372,6 +595,239 @@ bool Rasterizer::ensureTileBuffers(size_t splat_list_count, size_t offsets_count
         tile_offsets_capacity_ = offsets_count;
     }
     return true;
+}
+
+bool Rasterizer::ensureSortBuffers(int num_splats, size_t total_duplicates) {
+    size_t required_splats = static_cast<size_t>(num_splats);
+
+    // Per-splat buffers (counts + offsets)
+    if (required_splats > per_splat_capacity_) {
+        if (d_num_tiles_touched_) cudaFree(d_num_tiles_touched_);
+        if (d_dup_offsets_) cudaFree(d_dup_offsets_);
+        CUDA_CHECK(cudaMalloc(&d_num_tiles_touched_, required_splats * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_dup_offsets_, (required_splats + 1) * sizeof(int)));
+        per_splat_capacity_ = required_splats;
+    } else {
+        if (!d_num_tiles_touched_) CUDA_CHECK(cudaMalloc(&d_num_tiles_touched_, per_splat_capacity_ * sizeof(int)));
+        if (!d_dup_offsets_) CUDA_CHECK(cudaMalloc(&d_dup_offsets_, (per_splat_capacity_ + 1) * sizeof(int)));
+    }
+
+    // Duplicate arrays for sort
+    if (total_duplicates > sort_buffer_capacity_) {
+        if (d_keys_) cudaFree(d_keys_);
+        if (d_keys_sorted_) cudaFree(d_keys_sorted_);
+        if (d_values_) cudaFree(d_values_);
+        if (d_values_sorted_) cudaFree(d_values_sorted_);
+
+        CUDA_CHECK(cudaMalloc(&d_keys_, total_duplicates * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_keys_sorted_, total_duplicates * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_values_, total_duplicates * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_values_sorted_, total_duplicates * sizeof(int)));
+
+        sort_buffer_capacity_ = total_duplicates;
+    } else {
+        if (!d_keys_) CUDA_CHECK(cudaMalloc(&d_keys_, sort_buffer_capacity_ * sizeof(uint64_t)));
+        if (!d_keys_sorted_) CUDA_CHECK(cudaMalloc(&d_keys_sorted_, sort_buffer_capacity_ * sizeof(uint64_t)));
+        if (!d_values_) CUDA_CHECK(cudaMalloc(&d_values_, sort_buffer_capacity_ * sizeof(int)));
+        if (!d_values_sorted_) CUDA_CHECK(cudaMalloc(&d_values_sorted_, sort_buffer_capacity_ * sizeof(int)));
+    }
+
+    // RLE buffers (size <= total_duplicates)
+    size_t rle_needed = total_duplicates;
+    if (rle_needed > run_buffer_capacity_) {
+        if (d_tile_ids_sorted_) cudaFree(d_tile_ids_sorted_);
+        if (d_unique_tile_ids_) cudaFree(d_unique_tile_ids_);
+        if (d_run_lengths_) cudaFree(d_run_lengths_);
+        if (d_run_offsets_) cudaFree(d_run_offsets_);
+
+        if (rle_needed == 0) rle_needed = 1; // allocate minimal to avoid nullptr
+        CUDA_CHECK(cudaMalloc(&d_tile_ids_sorted_, rle_needed * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_unique_tile_ids_, rle_needed * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_run_lengths_, rle_needed * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_run_offsets_, rle_needed * sizeof(int)));
+
+        run_buffer_capacity_ = rle_needed;
+    } else {
+        if (!d_tile_ids_sorted_) CUDA_CHECK(cudaMalloc(&d_tile_ids_sorted_, run_buffer_capacity_ * sizeof(uint32_t)));
+        if (!d_unique_tile_ids_) CUDA_CHECK(cudaMalloc(&d_unique_tile_ids_, run_buffer_capacity_ * sizeof(uint32_t)));
+        if (!d_run_lengths_) CUDA_CHECK(cudaMalloc(&d_run_lengths_, run_buffer_capacity_ * sizeof(int)));
+        if (!d_run_offsets_) CUDA_CHECK(cudaMalloc(&d_run_offsets_, run_buffer_capacity_ * sizeof(int)));
+    }
+
+    if (!d_num_runs_device_) {
+        CUDA_CHECK(cudaMalloc(&d_num_runs_device_, sizeof(int)));
+    }
+
+    return true;
+}
+
+bool Rasterizer::debugValidateTileOffsets(int num_tiles, size_t total_duplicates) {
+#if defined(ENABLE_PROFILING) || !defined(NDEBUG)
+    std::vector<int> h_offsets(static_cast<size_t>(num_tiles) + 1);
+    CUDA_CHECK(cudaMemcpy(h_offsets.data(), d_tile_offsets_, (num_tiles + 1) * sizeof(int), cudaMemcpyDeviceToHost));
+
+    for (int t = 0; t < num_tiles; ++t) {
+        if (h_offsets[t] < 0) {
+            fprintf(stderr, "[validate] tile %d has negative offset %d\n", t, h_offsets[t]);
+            return false;
+        }
+        if (h_offsets[t] > h_offsets[t + 1]) {
+            fprintf(stderr, "[validate] tile_offsets not monotonic at tile %d: %d > %d\n", t, h_offsets[t], h_offsets[t + 1]);
+            return false;
+        }
+    }
+
+    if (static_cast<size_t>(h_offsets[num_tiles]) != total_duplicates) {
+        fprintf(stderr, "[validate] tail mismatch: tile_offsets[%d]=%d, expected %zu\n", num_tiles, h_offsets[num_tiles], total_duplicates);
+        return false;
+    }
+#else
+    (void)num_tiles;
+    (void)total_duplicates;
+#endif
+    return true;
+}
+
+bool Rasterizer::buildTileBinning(int num_splats, int num_tiles_x, int num_tiles_y, int num_tiles, size_t& total_duplicates) {
+    dim3 block256(256);
+    dim3 grid256((num_splats + 255) / 256);
+
+    // Ensure per-splat buffers exist (duplicates capacity will be resized after total_duplicates is known)
+    if (!ensureSortBuffers(num_splats, 1)) return false;
+
+    // Phase 1: tile touch counts
+    computeTileTouchCountKernel<<<grid256, block256>>>(
+        d_means2D_, d_radii_px_, num_splats, num_tiles_x, num_tiles_y, d_num_tiles_touched_);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 2: exclusive scan for duplicate offsets
+    size_t scan_temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
+
+    auto ensureCubTemp = [&](size_t bytes) -> bool {
+        if (bytes > cub_temp_bytes_) {
+            if (d_cub_temp_) cudaFree(d_cub_temp_);
+            cudaError_t err = cudaMalloc(&d_cub_temp_, bytes);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "cudaMalloc for CUB temp failed: %s\n", cudaGetErrorString(err));
+                return false;
+            }
+            cub_temp_bytes_ = bytes;
+        }
+        return true;
+    };
+
+    if (!ensureCubTemp(scan_temp_bytes)) return false;
+    cub::DeviceScan::ExclusiveSum(d_cub_temp_, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 3: compute total_duplicates safely
+    int last_offset = 0;
+    int last_count = 0;
+    CUDA_CHECK(cudaMemcpy(&last_offset, d_dup_offsets_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&last_count, d_num_tiles_touched_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
+
+    if (last_offset < 0 || last_count < 0) {
+        fprintf(stderr, "Invalid scan results: last_offset=%d, last_count=%d\n", last_offset, last_count);
+        return false;
+    }
+
+    size_t total = static_cast<size_t>(last_offset) + static_cast<size_t>(last_count);
+    if (total < static_cast<size_t>(last_offset)) {
+        fprintf(stderr, "Overflow computing total_duplicates\n");
+        return false;
+    }
+
+    if (total > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        fprintf(stderr, "total_duplicates=%zu exceeds int range\n", total);
+        return false;
+    }
+
+    const size_t max_per_splat = 1024; // conservative upper bound
+    size_t hard_cap = static_cast<size_t>(num_splats) * max_per_splat;
+    if (total > hard_cap) {
+        fprintf(stderr, "total_duplicates=%zu exceeds conservative cap=%zu; aborting to avoid OOM/overflow\n", total, hard_cap);
+        return false;
+    }
+
+    total_duplicates = total;
+
+    // Phase 4: allocate buffers based on total_duplicates
+    if (!ensureSortBuffers(num_splats, total_duplicates)) return false;
+    if (!ensureTileBuffers(total_duplicates, static_cast<size_t>(num_tiles) + 1)) return false;
+
+    if (total_duplicates == 0) {
+        CUDA_CHECK(cudaMemset(d_tile_offsets_, 0, (num_tiles + 1) * sizeof(int)));
+        return true;
+    }
+
+    // Phase 5: emit duplicate keys/values
+    emitDuplicateKeysKernel<<<grid256, block256>>>(
+        d_means2D_, d_radii_px_, d_depths_, num_splats, num_tiles_x, num_tiles_y,
+        d_dup_offsets_, d_keys_, d_values_);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 6: radix sort (tile_id primary, depth secondary)
+    size_t sort_temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(nullptr, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
+    if (!ensureCubTemp(sort_temp_bytes)) return false;
+    cub::DeviceRadixSort::SortPairs(d_cub_temp_, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 7: extract tile ids for RLE
+    dim3 gridDup((static_cast<int>(total_duplicates) + 255) / 256);
+    extractTileIdsKernel<<<gridDup, block256>>>(d_keys_sorted_, d_tile_ids_sorted_, static_cast<int>(total_duplicates));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 8: run-length encode tile ids
+    size_t rle_temp_bytes = 0;
+    cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
+        d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
+    if (!ensureCubTemp(rle_temp_bytes)) return false;
+    cub::DeviceRunLengthEncode::Encode(d_cub_temp_, rle_temp_bytes,
+        d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    int h_num_runs = 0;
+    CUDA_CHECK(cudaMemcpy(&h_num_runs, d_num_runs_device_, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_num_runs <= 0) {
+        fprintf(stderr, "Run-length encode produced zero runs while total_duplicates=%zu\n", total_duplicates);
+        return false;
+    }
+
+    // Phase 9: exclusive scan of run lengths -> run offsets
+    size_t run_scan_temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
+    if (!ensureCubTemp(run_scan_temp_bytes)) return false;
+    cub::DeviceScan::ExclusiveSum(d_cub_temp_, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Phase 10: scatter run offsets into tile_offsets
+    CUDA_CHECK(cudaMemset(d_tile_offsets_, 0xFF, (num_tiles + 1) * sizeof(int))); // set to -1
+    dim3 gridRuns((h_num_runs + 255) / 256);
+    scatterTileOffsetsKernel<<<gridRuns, block256>>>(d_unique_tile_ids_, d_run_offsets_, h_num_runs, d_tile_offsets_);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    setTileOffsetsTailKernel<<<1, 1>>>(d_tile_offsets_, num_tiles, static_cast<int>(total_duplicates));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    fillTileOffsetGapsKernel<<<1, 1>>>(d_tile_offsets_, num_tiles);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_DEBUG_SYNC();
+
+    // Copy sorted splat indices into tile_splat_list
+    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, d_values_sorted_, total_duplicates * sizeof(int), cudaMemcpyDeviceToDevice));
+
+    return debugValidateTileOffsets(num_tiles, total_duplicates);
 }
 
 bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians) {
@@ -515,6 +971,8 @@ bool Rasterizer::render_cuda(
             h_conic3D_[i * 3 + 2] = sp.cov_inv[1][1];
             
             h_opacities_[i] = sp.src->opacity;
+            h_radii_px_[i] = sp.radius_px;         // Conservative radius for tile binning
+            h_depths_[i] = sp.depth;                // Depth for back-to-front sorting
             
             // Use cached gaussian_id from ScreenSplat projection
             // Already assigned in cpu_rasterizer.cpp during projection
@@ -541,6 +999,10 @@ bool Rasterizer::render_cuda(
         CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D_.data(), 
                              num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities_.data(), 
+                             num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_radii_px_, h_radii_px_.data(),
+                             num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_depths_, h_depths_.data(),
                              num_splats * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_gaussian_ids_, h_gaussian_ids_.data(),
                              num_splats * sizeof(int), cudaMemcpyHostToDevice));
@@ -582,89 +1044,30 @@ bool Rasterizer::render_cuda(
     printf("✅ SH evaluation complete (GPU)\n");
     fflush(stdout);
 
-    // Build tile splat lists on CPU (linear layout)
-    printf("🔨 Building tile splat lists...\n");
+    // ============================================================
+    // GPU Tile Binning & Sorting Pipeline (Complete GPU-side)
+    // ============================================================
+    printf("🔨 GPU Tile Binning & Sorting (back-to-front)...\n");
     fflush(stdout);
 
     int num_tiles_x = (width + 15) / 16;
     int num_tiles_y = (height + 15) / 16;
     int num_tiles = num_tiles_x * num_tiles_y;
-
-    std::vector<int> h_tile_splat_indices;
-    std::vector<int> h_tile_offsets;
-    size_t total_tile_refs = 0;
+    size_t total_duplicates = 0;
 
     {
-        ScopedTimer timer("tile_list_build", &t_tile_ms);
-
-        std::vector<int> tile_counts(num_tiles, 0);
-
-        // First pass: count how many splats touch each tile
-        for (int idx = 0; idx < num_splats; ++idx) {
-            const gs::ScreenSplat& sp = screen_splats[idx];
-
-            float radius = sp.radius_px;
-            int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
-            int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
-            int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
-            int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
-
-            for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
-                for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
-                    int tile_id = ty * num_tiles_x + tx;
-                    ++tile_counts[tile_id];
-                }
-            }
+        ScopedTimer timer("gpu_tile_binning_sort", &t_tile_ms);
+        if (!buildTileBinning(num_splats, num_tiles_x, num_tiles_y, num_tiles, total_duplicates)) {
+            fprintf(stderr, "Tile binning failed\n");
+            return false;
         }
-
-        // Prefix sum: compute tile offsets (exclusive)
-        h_tile_offsets.assign(num_tiles + 1, 0);
-        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-            h_tile_offsets[tile_id + 1] = h_tile_offsets[tile_id] + tile_counts[tile_id];
-        }
-
-        // Allocate flat index buffer and per-tile cursor for filling
-        h_tile_splat_indices.assign(h_tile_offsets[num_tiles], 0);
-        std::vector<int> tile_cursor(num_tiles, 0);
-
-        // Second pass: fill indices in the same sorted order
-        for (int idx = 0; idx < num_splats; ++idx) {
-            const gs::ScreenSplat& sp = screen_splats[idx];
-
-            float radius = sp.radius_px;
-            int tile_x_min = std::max(0, static_cast<int>((sp.sx - radius) / 16.0f));
-            int tile_x_max = std::min(num_tiles_x - 1, static_cast<int>((sp.sx + radius) / 16.0f));
-            int tile_y_min = std::max(0, static_cast<int>((sp.sy - radius) / 16.0f));
-            int tile_y_max = std::min(num_tiles_y - 1, static_cast<int>((sp.sy + radius) / 16.0f));
-
-            for (int ty = tile_y_min; ty <= tile_y_max; ++ty) {
-                for (int tx = tile_x_min; tx <= tile_x_max; ++tx) {
-                    int tile_id = ty * num_tiles_x + tx;
-                    int write_idx = h_tile_offsets[tile_id] + tile_cursor[tile_id]++;
-                    h_tile_splat_indices[write_idx] = idx;
-                }
-            }
-        }
-
-        total_tile_refs = h_tile_splat_indices.size();
     }
 
-    printf("✅ Built tile lists: %zu total splat references across %d tiles\n",
-           h_tile_splat_indices.size(), num_tiles);
+    printf("✅ GPU tile binning & sorting complete: %zu duplicates, %d tiles\n",
+           total_duplicates, num_tiles);
     fflush(stdout);
 
-    // Ensure tile buffers have capacity and upload
-    if (!ensureTileBuffers(h_tile_splat_indices.size(), (size_t)(num_tiles + 1))) {
-        fprintf(stderr, "Failed to ensure tile buffer capacity\n");
-        return false;
-    }
-
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(),
-                         h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(),
-                         (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
-
-    // Launch tile-based rendering kernel
+    // Launch tile-based rendering kernel (unchanged)
     dim3 block(16, 16);
     dim3 grid(num_tiles_x, num_tiles_y);
 
@@ -707,7 +1110,7 @@ bool Rasterizer::render_cuda(
 #if ENABLE_PROFILING
     double cpu_total_ms = t_sh_ms + t_tile_ms + t_h2d_ms + t_d2h_ms;
     std::printf("[Profile] stats: splats_total=%d, tile_refs=%zu, res=%dx%d\n",
-                num_splats, total_tile_refs, width, height);
+                num_splats, total_duplicates, width, height);
     std::printf("[Profile] total_cpu_render: %.3f ms | total_gpu: %.3f ms\n",
                 cpu_total_ms, static_cast<double>(gpu_total_ms));
 #endif
@@ -752,6 +1155,8 @@ bool Rasterizer::render_cuda_to_rgba8_device(
         h_conic3D_[i * 3 + 1] = sp.cov_inv[0][1];
         h_conic3D_[i * 3 + 2] = sp.cov_inv[1][1];
         h_opacities_[i] = sp.src->opacity;
+        h_radii_px_[i] = sp.radius_px;
+        h_depths_[i] = sp.depth;
         
         // Use cached gaussian_id from ScreenSplat projection
         h_gaussian_ids_[i] = sp.gaussian_id;
@@ -766,6 +1171,8 @@ bool Rasterizer::render_cuda_to_rgba8_device(
     CUDA_CHECK(cudaMemcpy(d_means2D_, h_means2D_.data(), num_splats * 2 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_conic3D_, h_conic3D_.data(), num_splats * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_opacities_, h_opacities_.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_radii_px_, h_radii_px_.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_depths_, h_depths_.data(), num_splats * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_gaussian_ids_, h_gaussian_ids_.data(), num_splats * sizeof(int), cudaMemcpyHostToDevice));
 
     // Launch GPU SH evaluation kernel
@@ -799,49 +1206,15 @@ bool Rasterizer::render_cuda_to_rgba8_device(
     int num_tiles_x = (width + 15) / 16;
     int num_tiles_y = (height + 15) / 16;
     int num_tiles = num_tiles_x * num_tiles_y;
-    std::vector<int> h_tile_splat_indices;
-    std::vector<int> h_tile_offsets(num_tiles + 1, 0);
+    size_t total_duplicates = 0;
 
-    // Count
-    std::vector<int> tile_counts(num_tiles, 0);
-    for (int idx = 0; idx < num_splats; ++idx) {
-        const gs::ScreenSplat& sp = screen_splats[idx];
-        float radius = sp.radius_px;
-        int tx0 = std::max(0, (int)((sp.sx - radius) / 16.0f));
-        int tx1 = std::min(num_tiles_x - 1, (int)((sp.sx + radius) / 16.0f));
-        int ty0 = std::max(0, (int)((sp.sy - radius) / 16.0f));
-        int ty1 = std::min(num_tiles_y - 1, (int)((sp.sy + radius) / 16.0f));
-        for (int ty = ty0; ty <= ty1; ++ty)
-            for (int tx = tx0; tx <= tx1; ++tx)
-                ++tile_counts[ty * num_tiles_x + tx];
-    }
-    for (int t = 0; t < num_tiles; ++t) h_tile_offsets[t + 1] = h_tile_offsets[t] + tile_counts[t];
-    h_tile_splat_indices.assign(h_tile_offsets[num_tiles], 0);
-    std::vector<int> cursor(num_tiles, 0);
-    for (int idx = 0; idx < num_splats; ++idx) {
-        const gs::ScreenSplat& sp = screen_splats[idx];
-        float radius = sp.radius_px;
-        int tx0 = std::max(0, (int)((sp.sx - radius) / 16.0f));
-        int tx1 = std::min(num_tiles_x - 1, (int)((sp.sx + radius) / 16.0f));
-        int ty0 = std::max(0, (int)((sp.sy - radius) / 16.0f));
-        int ty1 = std::min(num_tiles_y - 1, (int)((sp.sy + radius) / 16.0f));
-        for (int ty = ty0; ty <= ty1; ++ty) {
-            for (int tx = tx0; tx <= tx1; ++tx) {
-                int tile_id = ty * num_tiles_x + tx;
-                int w = h_tile_offsets[tile_id] + cursor[tile_id]++;
-                h_tile_splat_indices[w] = idx;
-            }
+    // GPU tile binning & sorting (same as render_cuda)
+    {
+        if (!buildTileBinning(num_splats, num_tiles_x, num_tiles_y, num_tiles, total_duplicates)) {
+            fprintf(stderr, "Tile binning failed (PBO path)\n");
+            return false;
         }
     }
-
-    // Upload
-    // Ensure capacity and upload tile buffers
-    if (!ensureTileBuffers(h_tile_splat_indices.size(), (size_t)(num_tiles + 1))) {
-        fprintf(stderr, "Failed to ensure tile buffer capacity\n");
-        return false;
-    }
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, h_tile_splat_indices.data(), h_tile_splat_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tile_offsets_, h_tile_offsets.data(), (num_tiles + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
     // Render
     dim3 block(16, 16);
