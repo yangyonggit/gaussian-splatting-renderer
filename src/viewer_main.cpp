@@ -44,7 +44,6 @@
 
 static const int WINDOW_WIDTH = 1959;   // provided config width
 static const int WINDOW_HEIGHT = 1090;  // provided config height
-static const char* PLY_PATH = "train.ply";
 static const char* CAMERA_CONFIG_PATH = "cameras.json";
 
 // Provided camera parameters (intrinsics + pose)
@@ -191,24 +190,112 @@ void main() {
 )";
 
 // ============================================================
+// Forward Declarations
+// ============================================================
+
+struct GLResources {
+    GLuint program = 0;
+    GLuint pbo = 0;
+    cudaGraphicsResource* cuda_pbo_resource = nullptr;
+    gs::gl::FullscreenQuad quad;
+    gs::gl::Texture render_target;
+};
+
+static bool initGLFW();
+static GLFWwindow* createWindow();
+static bool initOpenGL();
+static void setupCallbacks(GLFWwindow* window);
+static gs::FpsCamera createCamera();
+static bool createGLResources(GLResources& resources);
+static bool loadAndPrepareScene(
+    const char* ply_path,
+    CpuRasterizer::Rasterizer& cpu_prep,
+    CudaRasterizer::Rasterizer& cuda_rasterizer,
+    std::vector<gs::GaussianSplat>& splats,
+    std::vector<gs::ScreenSplat>& screen_splats
+);
+static void mainLoop(
+    GLFWwindow* window,
+    gs::FpsCamera& camera,
+    GLResources& resources,
+    CpuRasterizer::Rasterizer& cpu_prep,
+    CudaRasterizer::Rasterizer& cuda_rasterizer,
+    std::vector<gs::GaussianSplat>& splats,
+    std::vector<gs::ScreenSplat>& screen_splats
+);
+static void cleanup(GLFWwindow* window, GLResources& resources, CudaRasterizer::Rasterizer& cuda_rasterizer);
+
+// ============================================================
 // Main
 // ============================================================
 
 int main(int argc, char* argv[]) {
+    const char* ply_path = (argc > 1) ? argv[1] : "train.ply";
+    
     std::cout << "🎮 Stage A: Interactive Gaussian Splatting Viewer" << std::endl;
     std::cout << "   WASD: move | Q/E: up/down | Mouse: look | ESC: quit" << std::endl;
+    std::cout << "   Loading: " << ply_path << std::endl;
 
-    // ---- GLFW & OpenGL Setup ----
+    if (!initGLFW()) return 1;
+
+    GLFWwindow* window = createWindow();
+    if (!window) {
+        glfwTerminate();
+        return 1;
+    }
+
+    if (!initOpenGL()) {
+        glfwTerminate();
+        return 1;
+    }
+
+    setupCallbacks(window);
+    gs::FpsCamera camera = createCamera();
+    g_camera = &camera;
+
+    GLResources resources;
+    if (!createGLResources(resources)) {
+        glfwTerminate();
+        return 1;
+    }
+
+    CpuRasterizer::Rasterizer cpu_prep;
+    CudaRasterizer::Rasterizer cuda_rasterizer;
+    std::vector<gs::GaussianSplat> splats;
+    std::vector<gs::ScreenSplat> screen_splats;
+
+    if (!loadAndPrepareScene(ply_path, cpu_prep, cuda_rasterizer, splats, screen_splats)) {
+        cleanup(window, resources, cuda_rasterizer);
+        glfwTerminate();
+        return 1;
+    }
+
+    mainLoop(window, camera, resources, cpu_prep, cuda_rasterizer, splats, screen_splats);
+
+    cleanup(window, resources, cuda_rasterizer);
+    glfwTerminate();
+
+    std::cout << "✅ Goodbye!" << std::endl;
+    return 0;
+}
+
+// ============================================================
+// Implementation
+// ============================================================
+
+bool initGLFW() {
     std::cout << "\n📺 Initializing GLFW..." << std::endl;
     glfwSetErrorCallback(glfwErrorCallback);
 
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
-        return 1;
+        return false;
     }
+    return true;
+}
 
+GLFWwindow* createWindow() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
@@ -216,29 +303,32 @@ int main(int argc, char* argv[]) {
                                           "MiniGS Viewer - Stage A", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        return 1;
+        return nullptr;
     }
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Vsync
+    return window;
+}
 
-    // Load OpenGL extensions
+bool initOpenGL() {
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "Failed to load OpenGL extensions" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
     std::cout << "✅ OpenGL " << glGetString(GL_VERSION) << std::endl;
+    return true;
+}
 
-    // ---- Setup Callbacks ----
+void setupCallbacks(GLFWwindow* window) {
     glfwSetKeyCallback(window, glfwKeyCallback);
     glfwSetCursorPosCallback(window, glfwMouseCallback);
     glfwSetMouseButtonCallback(window, glfwMouseButtonCallback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+}
 
-    // ---- Create Camera ----
+gs::FpsCamera createCamera() {
     std::cout << "\n📷 Initializing camera..." << std::endl;
     float init_yaw_deg = -90.0f;
     float init_pitch_deg = 0.0f;
@@ -246,108 +336,96 @@ int main(int argc, char* argv[]) {
 
     const float init_fov_y_deg = computeFovYDegFromFy(1164.6601287484507f, static_cast<float>(WINDOW_HEIGHT));
 
-    gs::FpsCamera camera(
-        CAM_INIT_POSITION,           // position from provided config
-        init_yaw_deg,                // yaw derived from rotation
-        init_pitch_deg,              // pitch derived from rotation
-        init_fov_y_deg,              // fov_y from fy/height
-        10.0f,                       // move_speed
-        0.1f                         // mouse_sensitivity
+    return gs::FpsCamera(
+        CAM_INIT_POSITION,
+        init_yaw_deg,
+        init_pitch_deg,
+        init_fov_y_deg,
+        10.0f,
+        0.1f
     );
-    g_camera = &camera;
+}
 
-    // ---- Create GL Resources ----
+bool createGLResources(GLResources& resources) {
     std::cout << "\n🎨 Creating OpenGL resources..." << std::endl;
 
-    // Compile shaders
     GLuint vs = gs::gl::compileShader(GL_VERTEX_SHADER, VERTEX_SHADER_SOURCE);
     GLuint fs = gs::gl::compileShader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
     if (!vs || !fs) {
         std::cerr << "Shader compilation failed" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
-    GLuint program = gs::gl::linkProgram(vs, fs);
-    if (!program) {
+    resources.program = gs::gl::linkProgram(vs, fs);
+    if (!resources.program) {
         std::cerr << "Program linking failed" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
-    // Create full-screen quad
-    gs::gl::FullscreenQuad quad;
-    if (!quad.init(program)) {
+    if (!resources.quad.init(resources.program)) {
         std::cerr << "Failed to initialize quad" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
-    // Create render target texture
-    gs::gl::Texture render_target;
-    if (!render_target.init(WINDOW_WIDTH, WINDOW_HEIGHT, GL_RGBA8)) {
+    if (!resources.render_target.init(WINDOW_WIDTH, WINDOW_HEIGHT, GL_RGBA8)) {
         std::cerr << "Failed to initialize render target texture" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
-    // Create PBO for CUDA-GL interop
-    GLuint pbo = 0;
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glGenBuffers(1, &resources.pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
     glBufferData(GL_PIXEL_UNPACK_BUFFER, WINDOW_WIDTH * WINDOW_HEIGHT * 4, nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    // Register PBO with CUDA
-    cudaGraphicsResource* cuda_pbo_resource = nullptr;
-    if (cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
+    if (cudaGraphicsGLRegisterBuffer(&resources.cuda_pbo_resource, resources.pbo, 
+                                     cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
         std::cerr << "Failed to register PBO with CUDA" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
     std::cout << "✅ GL resources created" << std::endl;
+    return true;
+}
 
-    // ---- Prepare CUDA Renderer ----
+bool loadAndPrepareScene(
+    const char* ply_path,
+    CpuRasterizer::Rasterizer& cpu_prep,
+    CudaRasterizer::Rasterizer& cuda_rasterizer,
+    std::vector<gs::GaussianSplat>& splats,
+    std::vector<gs::ScreenSplat>& screen_splats
+) {
     std::cout << "\n🚀 Preparing CUDA renderer..." << std::endl;
-    CpuRasterizer::Rasterizer cpu_prep;
-    CudaRasterizer::Rasterizer cuda_rasterizer;
 
-    // Preload the scene (splats + computed screen splats)
-    std::vector<gs::GaussianSplat> splats;
-    std::vector<gs::ScreenSplat> screen_splats;
+    glm::mat4 view = buildProvidedViewMatrix();
+    glm::mat4 proj = buildProvidedProjMatrix();
 
-    {
-        // Use the provided camera pose and intrinsics for initial scene load (match CLI path)
-        glm::mat4 view = buildProvidedViewMatrix();
-        glm::mat4 proj = buildProvidedProjMatrix();
-
-        if (!cpu_prep.prepareForCuda(PLY_PATH, view, proj,
-                                      WINDOW_WIDTH, WINDOW_HEIGHT,
-                                      splats, screen_splats)) {
-            std::cerr << "Failed to preprocess scene" << std::endl;
-            glfwTerminate();
-            return 1;
-        }
+    if (!cpu_prep.prepareForCuda(ply_path, view, proj,
+                                  WINDOW_WIDTH, WINDOW_HEIGHT,
+                                  splats, screen_splats)) {
+        std::cerr << "Failed to preprocess scene" << std::endl;
+        return false;
     }
 
     std::cout << "✅ Scene loaded: " << splats.size() << " splats" << std::endl;
 
-    // Upload scene-static data (SH coefficients, positions) to GPU (once)
     std::cout << "📤 Uploading scene-static SH data to GPU..." << std::endl;
     if (!cuda_rasterizer.uploadSceneData(splats)) {
         std::cerr << "Failed to upload scene data to GPU" << std::endl;
-        glfwTerminate();
-        return 1;
+        return false;
     }
 
+    return true;
+}
 
-    
-
-
-    // No CPU image needed with PBO interop
-
-    // ---- Main Loop ----
+void mainLoop(
+    GLFWwindow* window,
+    gs::FpsCamera& camera,
+    GLResources& resources,
+    CpuRasterizer::Rasterizer& cpu_prep,
+    CudaRasterizer::Rasterizer& cuda_rasterizer,
+    std::vector<gs::GaussianSplat>& splats,
+    std::vector<gs::ScreenSplat>& screen_splats
+) {
     std::cout << "\n▶️  Entering main loop..." << std::endl;
     double last_time = glfwGetTime();
     int frame_count = 0;
@@ -357,7 +435,6 @@ int main(int argc, char* argv[]) {
         float delta_time = static_cast<float>(current_time - last_time);
         last_time = current_time;
 
-        // ---- Update Camera ----
         camera.processKeyboard(
             g_key_w ? 1.0f : 0.0f,
             g_key_s ? 1.0f : 0.0f,
@@ -369,62 +446,52 @@ int main(int argc, char* argv[]) {
             g_key_shift
         );
 
-        // ---- Reproject Splats with Updated Camera ----
         {
-            // Compute new view/proj from FPS camera
             glm::mat4 view = camera.getViewMatrix();
             float aspect = static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT);
             glm::mat4 proj = camera.getProjMatrix(aspect);
 
-            // Reproject scene with new camera pose
             if (!cpu_prep.reprojectSplats(splats, view, proj, WINDOW_WIDTH, WINDOW_HEIGHT, screen_splats)) {
                 std::cerr << "Failed to reproject splats" << std::endl;
                 break;
             }
         }
 
-        // ---- Render Frame (CUDA) ----
         {
             ScopedTimer timer("cuda_render_frame");
-            // Map PBO for CUDA write
-            cudaGraphicsMapResources(1, &cuda_pbo_resource);
+            cudaGraphicsMapResources(1, &resources.cuda_pbo_resource);
             void* d_ptr = nullptr;
             size_t mapped_size = 0;
-            cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, cuda_pbo_resource);
+            cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, resources.cuda_pbo_resource);
 
-            // Render directly into PBO as RGBA8
             if (!cuda_rasterizer.render_cuda_to_rgba8_device(
                     screen_splats, camera.getPosition(),
                     WINDOW_WIDTH, WINDOW_HEIGHT,
                     reinterpret_cast<unsigned char*>(d_ptr))) {
                 std::cerr << "CUDA rendering (PBO) failed" << std::endl;
-                cudaGraphicsUnmapResources(1, &cuda_pbo_resource);
+                cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
                 break;
             }
 
-            cudaGraphicsUnmapResources(1, &cuda_pbo_resource);
+            cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
 
-            // Update texture from PBO without CPU copy
-            glBindTexture(GL_TEXTURE_2D, 0); // ensure our wrapper binds later
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-            // Bind our texture and upload from PBO
-            render_target.bind(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
+            resources.render_target.bind(0);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         }
 
-        // ---- Render to Screen ----
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        render_target.bind(0);
-        GLint tex_loc = glGetUniformLocation(program, "tex");
+        resources.render_target.bind(0);
+        GLint tex_loc = glGetUniformLocation(resources.program, "tex");
         glUniform1i(tex_loc, 0);
 
-        quad.draw();
+        resources.quad.draw();
 
-        // ---- Swap Buffers & Poll Events ----
         glfwSwapBuffers(window);
         glfwPollEvents();
 
@@ -437,19 +504,15 @@ int main(int argc, char* argv[]) {
                        delta_time * 1000.0f);
         }
     }
+}
 
-    // ---- Cleanup ----
+void cleanup(GLFWwindow* window, GLResources& resources, CudaRasterizer::Rasterizer& cuda_rasterizer) {
     std::cout << "\n🧹 Cleaning up..." << std::endl;
-    quad.cleanup();
-    render_target.cleanup();
-    if (cuda_pbo_resource) cudaGraphicsUnregisterResource(cuda_pbo_resource);
-    if (pbo) glDeleteBuffers(1, &pbo);
-    glDeleteProgram(program);
+    resources.quad.cleanup();
+    resources.render_target.cleanup();
+    if (resources.cuda_pbo_resource) cudaGraphicsUnregisterResource(resources.cuda_pbo_resource);
+    if (resources.pbo) glDeleteBuffers(1, &resources.pbo);
+    if (resources.program) glDeleteProgram(resources.program);
     cuda_rasterizer.free();
-
     glfwDestroyWindow(window);
-    glfwTerminate();
-
-    std::cout << "✅ Goodbye!" << std::endl;
-    return 0;
 }
