@@ -108,6 +108,8 @@ file(GLOB_RECURSE CUDA_SOURCES "src/*.cu")
 
 # Exclude viewer_main.cpp from MiniGSRenderer target
 list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/viewer_main.cpp")
+# Exclude progressive viewer TU from CLI target to avoid duplicate symbols
+list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/viewer_progressive.cpp")
 # Exclude legacy STB impl TU to avoid duplicate symbol definitions
 list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/stb_image_write_impl.cpp")
 
@@ -170,8 +172,35 @@ target_include_directories(viewer_main
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# ----------------------------------------------------------
+# 4b. Viewer Target (Progressive reveal viewer)
+# ----------------------------------------------------------
+message(STATUS "🎮 Building progressive viewer target...")
+
+add_executable(viewer_progressive
+    src/viewer_progressive.cpp
+    src/cuda_rasterizer.cu
+    src/cpu_rasterizer.cpp
+    src/ellipse.cpp
+    src/ply_loader.cpp
+    src/sh_color.cpp
+)
+
+target_link_libraries(viewer_progressive PRIVATE
+    glm::glm
+    glfw
+    glad
+    CUDA::cudart
+    nlohmann_json::nlohmann_json
+)
+
+target_include_directories(viewer_progressive
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Put both executables in the same directory
-set_target_properties(viewer_main MiniGSRenderer PROPERTIES
+set_target_properties(viewer_main viewer_progressive MiniGSRenderer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
 )
 
