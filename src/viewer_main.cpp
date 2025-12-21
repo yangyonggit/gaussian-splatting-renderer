@@ -21,6 +21,7 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
 
 // CRITICAL: GLAD must be included before GLFW or any OpenGL headers
 #include <glad/glad.h>
@@ -30,6 +31,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+#include <nlohmann/json.hpp>
 
 #include "gs/fps_camera.h"
 #include "gs/gl_utils.h"
@@ -37,6 +39,8 @@
 #include "gs/sh_color.h"
 #include "cpu_rasterizer.h"
 #include "cuda_rasterizer.h"
+
+using json = nlohmann::json;
 
 // ============================================================
 // Configuration
@@ -82,6 +86,117 @@ static glm::mat4 buildProvidedProjMatrix() {
     float fov_y = 2.0f * std::atan(static_cast<float>(WINDOW_HEIGHT) / (2.0f * 1164.6601287484507f));
     float aspect = WINDOW_WIDTH / static_cast<float>(WINDOW_HEIGHT);
     return glm::perspective(fov_y, aspect, 0.01f, 100.0f);
+}
+
+// ============================================================
+// Camera Config Loading
+// ============================================================
+
+struct CameraConfig {
+    glm::vec3 position;
+    float fx, fy, cx, cy;
+    glm::mat4 view;
+    glm::mat4 proj;
+    bool valid = false;
+};
+
+static CameraConfig loadCameraFromJson(const std::string& json_path, int camera_id = 0) {
+    CameraConfig config;
+    
+    std::ifstream file(json_path);
+    if (!file.is_open()) {
+        std::cout << "⚠️  Camera config not found at: " << json_path << std::endl;
+        return config;
+    }
+
+    try {
+        json j;
+        file >> j;
+        // The file is a top-level array of camera entries
+        if (j.is_array() && !j.empty()) {
+            // Prefer selecting by matching `id`; fall back to clamped index
+            int chosen_index = -1;
+            for (size_t i = 0; i < j.size(); ++i) {
+                const auto& node = j[i];
+                if (node.contains("id") && node["id"].is_number_integer() && node["id"].get<int>() == camera_id) {
+                    chosen_index = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (chosen_index == -1) {
+                chosen_index = std::min<int>(camera_id, static_cast<int>(j.size() - 1));
+                if (chosen_index < 0) chosen_index = 0;
+            }
+
+            const auto& cam = j[chosen_index];
+
+            // Position
+            if (cam.contains("position") && cam["position"].is_array() && cam["position"].size() == 3) {
+                config.position = glm::vec3(
+                    cam["position"][0].get<float>(),
+                    cam["position"][1].get<float>(),
+                    cam["position"][2].get<float>()
+                );
+            }
+
+            // Rotation rows: 3x3 matrix (camera-to-world, row-major)
+            bool have_rotation = (
+                cam.contains("rotation") && cam["rotation"].is_array() && cam["rotation"].size() == 3 &&
+                cam["rotation"][0].is_array() && cam["rotation"][1].is_array() && cam["rotation"][2].is_array() &&
+                cam["rotation"][0].size() == 3 && cam["rotation"][1].size() == 3 && cam["rotation"][2].size() == 3
+            );
+
+            if (have_rotation) {
+                float r00 = cam["rotation"][0][0].get<float>();
+                float r01 = cam["rotation"][0][1].get<float>();
+                float r02 = cam["rotation"][0][2].get<float>();
+                float r10 = cam["rotation"][1][0].get<float>();
+                float r11 = cam["rotation"][1][1].get<float>();
+                float r12 = cam["rotation"][1][2].get<float>();
+                float r20 = cam["rotation"][2][0].get<float>();
+                float r21 = cam["rotation"][2][1].get<float>();
+                float r22 = cam["rotation"][2][2].get<float>();
+
+                // Convert row-major rotation to column vectors (GLM is column-major)
+                glm::vec3 right(r00, r10, r20);
+                glm::vec3 up(r01, r11, r21);
+                glm::vec3 forward(r02, r12, r22);
+
+                glm::mat4 c2w(1.0f);
+                c2w[0] = glm::vec4(right, 0.0f);
+                c2w[1] = glm::vec4(up, 0.0f);
+                c2w[2] = glm::vec4(forward, 0.0f);
+                c2w[3] = glm::vec4(config.position, 1.0f);
+
+                // world-to-camera = inverse(camera-to-world)
+                config.view = glm::inverse(c2w);
+            } else {
+                // Fallback if rotation missing
+                config.view = buildProvidedViewMatrix();
+            }
+
+            // Intrinsics
+            if (cam.contains("fx")) config.fx = cam["fx"].get<float>();
+            if (cam.contains("fy")) config.fy = cam["fy"].get<float>();
+
+            int w = WINDOW_WIDTH;
+            int h = WINDOW_HEIGHT;
+            if (cam.contains("width")) w = cam["width"].get<int>();
+            if (cam.contains("height")) h = cam["height"].get<int>();
+
+            float fov_y = 2.0f * std::atan(static_cast<float>(h) / (2.0f * config.fy));
+            float aspect = static_cast<float>(w) / static_cast<float>(h);
+            config.proj = glm::perspective(fov_y, aspect, 0.01f, 100.0f);
+
+            config.valid = true;
+            std::cout << "✅ Loaded camera id=" << camera_id << " (index=" << chosen_index << ") from: " << json_path << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "⚠️  Failed to parse JSON: " << e.what() << std::endl;
+    }
+
+    file.close();
+    return config;
 }
 
 // ============================================================
@@ -230,11 +345,31 @@ static void cleanup(GLFWwindow* window, GLResources& resources, CudaRasterizer::
 // ============================================================
 
 int main(int argc, char* argv[]) {
-    const char* ply_path = (argc > 1) ? argv[1] : "train.ply";
+    // Parse command line arguments
+    const char* ply_path = nullptr;
+    std::string camera_config_path = "cameras.json";  // default
+    int camera_id = 0;  // default
+
+    // Simple argument parser: viewer_main <ply> [camera_config] [camera_id]
+    if (argc > 1) {
+        ply_path = argv[1];
+    } else {
+        std::cerr << "Usage: viewer_main <ply_file> [camera_config.json] [camera_id]" << std::endl;
+        return 1;
+    }
+
+    if (argc > 2) {
+        camera_config_path = argv[2];
+    }
+
+    if (argc > 3) {
+        camera_id = std::atoi(argv[3]);
+    }
     
     std::cout << "🎮 Stage A: Interactive Gaussian Splatting Viewer" << std::endl;
     std::cout << "   WASD: move | Q/E: up/down | Mouse: look | ESC: quit" << std::endl;
-    std::cout << "   Loading: " << ply_path << std::endl;
+    std::cout << "   PLY: " << ply_path << std::endl;
+    std::cout << "   Camera config: " << camera_config_path << " (id=" << camera_id << ")" << std::endl;
 
     if (!initGLFW()) return 1;
 
@@ -269,6 +404,43 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
+
+    // Try to load camera config from JSON; if not available, use hardcoded defaults
+    CameraConfig cam_config = loadCameraFromJson(camera_config_path, camera_id);
+    
+    glm::mat4 view_matrix, proj_matrix;
+    if (cam_config.valid) {
+        view_matrix = cam_config.view;
+        proj_matrix = cam_config.proj;
+        std::cout << "📷 Using camera config from JSON" << std::endl;
+
+        // Sync interactive camera with loaded config
+        camera.setPosition(cam_config.position);
+        // Derive yaw/pitch from forward vector in c2w
+        glm::mat4 c2w = glm::inverse(view_matrix);
+        glm::vec3 forward(c2w[2].x, c2w[2].y, c2w[2].z);
+        float cfg_yaw = -90.0f, cfg_pitch = 0.0f;
+        computeYawPitchFromForward(forward, cfg_yaw, cfg_pitch);
+        camera.setYaw(cfg_yaw);
+        camera.setPitch(cfg_pitch);
+
+        // Set camera FOV from fy (fallback to provided value if missing)
+        float fy_for_fov = (cam_config.fy > 0.0f) ? cam_config.fy : 1164.6601287484507f;
+        camera.setFovY(computeFovYDegFromFy(fy_for_fov, static_cast<float>(WINDOW_HEIGHT)));
+    } else {
+        view_matrix = buildProvidedViewMatrix();
+        proj_matrix = buildProvidedProjMatrix();
+        std::cout << "📷 Using hardcoded default camera" << std::endl;
+    }
+
+    // Reproject with the selected camera
+    if (!cpu_prep.reprojectSplats(splats, view_matrix, proj_matrix, WINDOW_WIDTH, WINDOW_HEIGHT, screen_splats)) {
+        std::cerr << "Failed to reproject splats" << std::endl;
+        cleanup(window, resources, cuda_rasterizer);
+        glfwTerminate();
+        return 1;
+    }
+    std::cout << "✅ Projected " << screen_splats.size() << " visible splats" << std::endl;
 
     mainLoop(window, camera, resources, cpu_prep, cuda_rasterizer, splats, screen_splats);
 
