@@ -38,6 +38,7 @@
 #include "gs/profiler.h"
 #include "gs/sh_color.h"
 #include "gs/nvtx_helper.h"
+#include "gs/ply_loader.h"
 #include "cpu_rasterizer.h"
 #include "cuda_rasterizer.h"
 
@@ -573,13 +574,12 @@ bool loadAndPrepareScene(
     
     std::cout << "\n🚀 Preparing CUDA renderer..." << std::endl;
 
-    glm::mat4 view = buildProvidedViewMatrix();
-    glm::mat4 proj = buildProvidedProjMatrix();
+    (void)cpu_prep;
+    screen_splats.clear();
 
-    if (!cpu_prep.prepareForCuda(ply_path, view, proj,
-                                  WINDOW_WIDTH, WINDOW_HEIGHT,
-                                  splats, screen_splats)) {
-        std::cerr << "Failed to preprocess scene" << std::endl;
+    splats = gs::loadGaussianPly(ply_path);
+    if (splats.empty()) {
+        std::cerr << "Failed to load PLY file or file is empty!" << std::endl;
         return false;
     }
 
@@ -623,20 +623,16 @@ void mainLoop(
             g_key_shift
         );
 
-        {
-            gs::NvtxRange nvtx_reproject("CPU_Reproject_Splats");
-            glm::mat4 view = camera.getViewMatrix();
-            float aspect = static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT);
-            glm::mat4 proj = camera.getProjMatrix(aspect);
+        (void)cpu_prep;
+        (void)splats;
+        (void)screen_splats;
 
-            if (!cpu_prep.reprojectSplats(splats, view, proj, WINDOW_WIDTH, WINDOW_HEIGHT, screen_splats)) {
-                std::cerr << "Failed to reproject splats" << std::endl;
-                break;
-            }
-        }
+        glm::mat4 view = camera.getViewMatrix();
+        float aspect = static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT);
+        glm::mat4 proj = camera.getProjMatrix(aspect);
 
         {
-            gs::NvtxRange nvtx_cuda_frame("CUDA_Render_Frame");
+            gs::NvtxRange nvtx_cuda_frame("CUDA_Render_Frame_V2");
             ScopedTimer timer("cuda_render_frame");
             cudaGraphicsMapResources(1, &resources.cuda_pbo_resource);
             void* d_ptr = nullptr;
@@ -644,9 +640,9 @@ void mainLoop(
             cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, resources.cuda_pbo_resource);
 
             {
-                gs::NvtxRange nvtx_render_call("Render_CUDA_To_PBO");
-                if (!cuda_rasterizer.render_cuda_to_rgba8_device(
-                        screen_splats, camera.getPosition(),
+                gs::NvtxRange nvtx_render_call("Render_CUDA_To_PBO_V2");
+                if (!cuda_rasterizer.render_cuda_to_rgba8_device_v2(
+                        view, proj, camera.getPosition(),
                         WINDOW_WIDTH, WINDOW_HEIGHT,
                         reinterpret_cast<unsigned char*>(d_ptr))) {
                     std::cerr << "CUDA rendering (PBO) failed" << std::endl;

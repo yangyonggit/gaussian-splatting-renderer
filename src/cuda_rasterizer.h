@@ -69,6 +69,17 @@ public:
         unsigned char* out_rgba8_device
     );
 
+    // V2: Full GPU preprocess (project + ellipse params) then render into device RGBA8.
+    // Uses scene-static buffers uploaded via uploadSceneData().
+    bool render_cuda_to_rgba8_device_v2(
+        const glm::mat4& view,
+        const glm::mat4& proj,
+        const glm::vec3& camera_pos,
+        int width,
+        int height,
+        unsigned char* out_rgba8_device
+    );
+
     /**
      * Free all GPU memory
      */
@@ -86,6 +97,9 @@ private:
 
     // Scene-static data (uploaded once, kept resident across frames)
     float* d_pos_ws_ = nullptr;         // World positions [N*3]: (x,y,z) interleaved
+    float* d_scale_ = nullptr;          // World-space axis scales [N*3]
+    float* d_rotation_ = nullptr;       // Rotation quaternion [N*4] as (w,x,y,z)
+    float* d_opacity_scene_ = nullptr;  // Opacity [N]
     float* d_sh_coeffs_ = nullptr;      // SH coefficients [N*27]: (R_0..8, G_0..8, B_0..8) - Degree 2
     float* d_dc_colors_ = nullptr;      // DC (0-order SH) colors [N*3]
     size_t scene_splat_capacity_ = 0;   // Capacity for scene data

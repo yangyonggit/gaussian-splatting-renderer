@@ -15,6 +15,58 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_run_length_encode.cuh>
 
+// Lightweight matrix struct to avoid relying on GLM mat operations in device code.
+// Layout matches GLM column-major: m[col*4 + row]
+struct Mat4f {
+    float m[16];
+};
+
+__host__ inline Mat4f toMat4f(const glm::mat4& M) {
+    Mat4f out{};
+    const float* p = &M[0][0];
+    std::memcpy(out.m, p, 16 * sizeof(float));
+    return out;
+}
+
+__device__ __forceinline__ float4 mulMat4Vec4(const Mat4f& M, const float4& v) {
+    return make_float4(
+        M.m[0] * v.x + M.m[4] * v.y + M.m[8]  * v.z + M.m[12] * v.w,
+        M.m[1] * v.x + M.m[5] * v.y + M.m[9]  * v.z + M.m[13] * v.w,
+        M.m[2] * v.x + M.m[6] * v.y + M.m[10] * v.z + M.m[14] * v.w,
+        M.m[3] * v.x + M.m[7] * v.y + M.m[11] * v.z + M.m[15] * v.w
+    );
+}
+
+__device__ __forceinline__ float2 ndcToPixelEllipse(float ndc_x, float ndc_y, int width, int height) {
+    // Must match gs::projectToScreenEllipse's ndcToPixel() exactly.
+    float sx = (1.0f - (ndc_x * 0.5f + 0.5f)) * static_cast<float>(width);
+    float sy = (ndc_y * 0.5f + 0.5f) * static_cast<float>(height);
+    return make_float2(sx, sy);
+}
+
+__device__ __forceinline__ float clampf(float x, float a, float b) {
+    return fminf(fmaxf(x, a), b);
+}
+
+__device__ __forceinline__ void quatToMat3Cols(float qw, float qx, float qy, float qz,
+                                               float3& c0, float3& c1, float3& c2) {
+    // Quaternion (w,x,y,z) to rotation matrix columns, consistent with GLM mat3_cast.
+    float xx = qx * qx;
+    float yy = qy * qy;
+    float zz = qz * qz;
+    float xy = qx * qy;
+    float xz = qx * qz;
+    float yz = qy * qz;
+    float wx = qw * qx;
+    float wy = qw * qy;
+    float wz = qw * qz;
+
+    // Columns of the rotation matrix
+    c0 = make_float3(1.0f - 2.0f * (yy + zz), 2.0f * (xy + wz),         2.0f * (xz - wy));
+    c1 = make_float3(2.0f * (xy - wz),         1.0f - 2.0f * (xx + zz), 2.0f * (yz + wx));
+    c2 = make_float3(2.0f * (xz + wy),         2.0f * (yz - wx),         1.0f - 2.0f * (xx + yy));
+}
+
 // CUDA error checking macros
 #define CUDA_CHECK(call) \
     do { \
@@ -111,6 +163,12 @@ __global__ void computeTileTouchCountKernel(
     float sy = means2D[idx * 2 + 1];
     float radius = radii_px[idx];
 
+    // Cull invalid/disabled splats early.
+    if (!(radius > 0.0f) || !isfinite(sx) || !isfinite(sy)) {
+        num_tiles_touched[idx] = 0;
+        return;
+    }
+
     // Compute tile bounding box
     int tile_x_min = max(0, (int)((sx - radius) / 16.0f));
     int tile_x_max = min(num_tiles_x - 1, (int)((sx + radius) / 16.0f));
@@ -125,6 +183,184 @@ __global__ void computeTileTouchCountKernel(
 
     int count = (tile_x_max - tile_x_min + 1) * (tile_y_max - tile_y_min + 1);
     num_tiles_touched[idx] = count;
+}
+
+// ============================================================
+// CUDA Kernel: GPU Preprocess (project + ellipse params)
+// Mirrors gs::projectToScreenEllipse() logic.
+// ============================================================
+
+__global__ void preprocessKernel(
+    const float* __restrict__ pos_ws_xyz,      // [N*3]
+    const float* __restrict__ scales_xyz,      // [N*3]
+    const float* __restrict__ rotations_wxyz,  // [N*4] (w,x,y,z)
+    const float* __restrict__ opacity_scene,   // [N]
+    int num_splats,
+    Mat4f view,
+    Mat4f proj,
+    int width,
+    int height,
+    float* __restrict__ means2D,               // [N*2]
+    float* __restrict__ conic3D,               // [N*3] (inv00, inv01, inv11)
+    float* __restrict__ opacities,             // [N]
+    float* __restrict__ radii_px,              // [N] (<=0 means culled)
+    float* __restrict__ depths,                // [N]
+    int* __restrict__ gaussian_ids             // [N]
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_splats) return;
+
+    gaussian_ids[idx] = idx;
+    float opacity = opacity_scene ? opacity_scene[idx] : 1.0f;
+    opacities[idx] = opacity;
+
+    float px = pos_ws_xyz[idx * 3 + 0];
+    float py = pos_ws_xyz[idx * 3 + 1];
+    float pz = pos_ws_xyz[idx * 3 + 2];
+
+    float sx3 = scales_xyz[idx * 3 + 0];
+    float sy3 = scales_xyz[idx * 3 + 1];
+    float sz3 = scales_xyz[idx * 3 + 2];
+
+    float qw = rotations_wxyz[idx * 4 + 0];
+    float qx = rotations_wxyz[idx * 4 + 1];
+    float qy = rotations_wxyz[idx * 4 + 2];
+    float qz = rotations_wxyz[idx * 4 + 3];
+
+    // Center: clip = proj * view * [p,1]
+    float4 center_ws = make_float4(px, py, pz, 1.0f);
+    float4 center_vs = mulMat4Vec4(view, center_ws);
+    float4 center_cs = mulMat4Vec4(proj, center_vs);
+
+    // Match CPU: if center_cs.w <= 0 -> behind camera
+    if (!(center_cs.w > 0.0f) || !isfinite(center_cs.w)) {
+        means2D[idx * 2 + 0] = 0.0f;
+        means2D[idx * 2 + 1] = 0.0f;
+        conic3D[idx * 3 + 0] = 0.0f;
+        conic3D[idx * 3 + 1] = 0.0f;
+        conic3D[idx * 3 + 2] = 0.0f;
+        radii_px[idx] = -1.0f;
+        depths[idx] = 0.0f;
+        opacities[idx] = 0.0f;
+        return;
+    }
+
+    float inv_w = 1.0f / center_cs.w;
+    float ndc_x = center_cs.x * inv_w;
+    float ndc_y = center_cs.y * inv_w;
+    float ndc_z = center_cs.z * inv_w;
+
+    // Match CPU's optional Z reject
+    if (ndc_z < -1.5f || ndc_z > 1.5f || !isfinite(ndc_z)) {
+        means2D[idx * 2 + 0] = 0.0f;
+        means2D[idx * 2 + 1] = 0.0f;
+        conic3D[idx * 3 + 0] = 0.0f;
+        conic3D[idx * 3 + 1] = 0.0f;
+        conic3D[idx * 3 + 2] = 0.0f;
+        radii_px[idx] = -1.0f;
+        depths[idx] = 0.0f;
+        opacities[idx] = 0.0f;
+        return;
+    }
+
+    float2 center_px = ndcToPixelEllipse(ndc_x, ndc_y, width, height);
+
+    // Rotation columns
+    float3 c0, c1, c2;
+    quatToMat3Cols(qw, qx, qy, qz, c0, c1, c2);
+
+    // Principal axes in world space (columns scaled)
+    float3 axes_ws[3];
+    axes_ws[0] = make_float3(c0.x * sx3, c0.y * sx3, c0.z * sx3);
+    axes_ws[1] = make_float3(c1.x * sy3, c1.y * sy3, c1.z * sy3);
+    axes_ws[2] = make_float3(c2.x * sz3, c2.y * sz3, c2.z * sz3);
+
+    float2 axes_2d[3];
+    float max_len2 = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        float4 end_ws = make_float4(px + axes_ws[i].x, py + axes_ws[i].y, pz + axes_ws[i].z, 1.0f);
+        float4 end_vs = mulMat4Vec4(view, end_ws);
+        float4 end_cs = mulMat4Vec4(proj, end_vs);
+
+        // Match CPU: if end_cs.w <= 0, push w to small positive to avoid div0
+        if (!(end_cs.w > 0.0f) || !isfinite(end_cs.w)) {
+            end_cs.w = 1e-3f;
+        }
+
+        float inv_end_w = 1.0f / end_cs.w;
+        float end_ndc_x = end_cs.x * inv_end_w;
+        float end_ndc_y = end_cs.y * inv_end_w;
+        float2 end_px = ndcToPixelEllipse(end_ndc_x, end_ndc_y, width, height);
+
+        float2 a = make_float2(end_px.x - center_px.x, end_px.y - center_px.y);
+        axes_2d[i] = a;
+        float len2 = a.x * a.x + a.y * a.y;
+        if (len2 > max_len2) max_len2 = len2;
+    }
+
+    if (!(max_len2 > 1e-8f) || !isfinite(max_len2)) {
+        means2D[idx * 2 + 0] = 0.0f;
+        means2D[idx * 2 + 1] = 0.0f;
+        conic3D[idx * 3 + 0] = 0.0f;
+        conic3D[idx * 3 + 1] = 0.0f;
+        conic3D[idx * 3 + 2] = 0.0f;
+        radii_px[idx] = -1.0f;
+        depths[idx] = 0.0f;
+        opacities[idx] = 0.0f;
+        return;
+    }
+
+    // Build 2D covariance as sum outer products (pixels)
+    float cov00 = 0.0f;
+    float cov01 = 0.0f;
+    float cov11 = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        float ax = axes_2d[i].x;
+        float ay = axes_2d[i].y;
+        cov00 += ax * ax;
+        cov01 += ax * ay;
+        cov11 += ay * ay;
+    }
+
+    // Regularization: eps = 1e-3 * trace + 1e-6
+    float trace = cov00 + cov11;
+    float eps = 1e-3f * trace + 1e-6f;
+    cov00 += eps;
+    cov11 += eps;
+
+    float det = cov00 * cov11 - cov01 * cov01;
+    if (!(det > 0.0f) || !isfinite(det)) {
+        means2D[idx * 2 + 0] = 0.0f;
+        means2D[idx * 2 + 1] = 0.0f;
+        conic3D[idx * 3 + 0] = 0.0f;
+        conic3D[idx * 3 + 1] = 0.0f;
+        conic3D[idx * 3 + 2] = 0.0f;
+        radii_px[idx] = -1.0f;
+        depths[idx] = 0.0f;
+        opacities[idx] = 0.0f;
+        return;
+    }
+
+    float inv_det = 1.0f / det;
+    float inv00 = cov11 * inv_det;
+    float inv01 = -cov01 * inv_det;
+    float inv11 = cov00 * inv_det;
+
+    float max_len = sqrtf(max_len2);
+    float radius = max_len * 3.0f;
+    radius = clampf(radius, 1.0f, 1024.0f);
+
+    means2D[idx * 2 + 0] = center_px.x;
+    means2D[idx * 2 + 1] = center_px.y;
+    conic3D[idx * 3 + 0] = inv00;
+    conic3D[idx * 3 + 1] = inv01;
+    conic3D[idx * 3 + 2] = inv11;
+    radii_px[idx] = radius;
+    depths[idx] = ndc_z * 0.5f + 0.5f;
 }
 
 /**
@@ -549,6 +785,9 @@ void Rasterizer::free() {
     freeFrameBuffers();
     // Free scene-static data
     if (d_pos_ws_) { cudaFree(d_pos_ws_); d_pos_ws_ = nullptr; }
+    if (d_scale_) { cudaFree(d_scale_); d_scale_ = nullptr; }
+    if (d_rotation_) { cudaFree(d_rotation_); d_rotation_ = nullptr; }
+    if (d_opacity_scene_) { cudaFree(d_opacity_scene_); d_opacity_scene_ = nullptr; }
     if (d_sh_coeffs_) { cudaFree(d_sh_coeffs_); d_sh_coeffs_ = nullptr; }
     if (d_dc_colors_) { cudaFree(d_dc_colors_); d_dc_colors_ = nullptr; }
     scene_splat_capacity_ = 0;
@@ -873,6 +1112,9 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
 
     // Prepare host buffers - use tightly packed float arrays to avoid GLM alignment issues
     std::vector<float> h_pos_ws(num * 3);  // Tightly packed x,y,z floats
+    std::vector<float> h_scale(num * 3);
+    std::vector<float> h_rotation(num * 4); // (w,x,y,z)
+    std::vector<float> h_opacity(num);
     std::vector<float> h_dc_colors(num * 3);
     std::vector<float> h_sh_coeffs(num * 27);  // 3 channels * 9 basis functions (Degree 2)
 
@@ -883,6 +1125,17 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
         h_pos_ws[i * 3 + 0] = g.position_ws.x;
         h_pos_ws[i * 3 + 1] = g.position_ws.y;
         h_pos_ws[i * 3 + 2] = g.position_ws.z;
+
+        h_scale[i * 3 + 0] = g.scale.x;
+        h_scale[i * 3 + 1] = g.scale.y;
+        h_scale[i * 3 + 2] = g.scale.z;
+
+        h_rotation[i * 4 + 0] = g.rotation.w;
+        h_rotation[i * 4 + 1] = g.rotation.x;
+        h_rotation[i * 4 + 2] = g.rotation.y;
+        h_rotation[i * 4 + 3] = g.rotation.z;
+
+        h_opacity[i] = g.opacity;
         
         h_dc_colors[i * 3 + 0] = g.dc_color.r;
         h_dc_colors[i * 3 + 1] = g.dc_color.g;
@@ -910,10 +1163,16 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
     // Allocate/reallocate device memory only if capacity grows
     if (num > scene_splat_capacity_) {
         if (d_pos_ws_) cudaFree(d_pos_ws_);
+        if (d_scale_) cudaFree(d_scale_);
+        if (d_rotation_) cudaFree(d_rotation_);
+        if (d_opacity_scene_) cudaFree(d_opacity_scene_);
         if (d_sh_coeffs_) cudaFree(d_sh_coeffs_);
         if (d_dc_colors_) cudaFree(d_dc_colors_);
 
         CUDA_CHECK(cudaMalloc(&d_pos_ws_, num * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_scale_, num * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_rotation_, num * 4 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_opacity_scene_, num * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_sh_coeffs_, num * 27 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_dc_colors_, num * 3 * sizeof(float)));
         scene_splat_capacity_ = num;
@@ -924,6 +1183,12 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
         gs::NvtxRange nvtx_h2d("Upload_Scene_H2D");
         printf("  Uploading pos_ws: %zu bytes\n", num * 3 * sizeof(float));
         CUDA_CHECK(cudaMemcpy(d_pos_ws_, h_pos_ws.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        printf("  Uploading scale: %zu bytes\n", num * 3 * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_scale_, h_scale.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        printf("  Uploading rotation: %zu bytes\n", num * 4 * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_rotation_, h_rotation.data(), num * 4 * sizeof(float), cudaMemcpyHostToDevice));
+        printf("  Uploading opacity: %zu bytes\n", num * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_opacity_scene_, h_opacity.data(), num * sizeof(float), cudaMemcpyHostToDevice));
         printf("  Uploading sh_coeffs: %zu bytes\n", num * 27 * sizeof(float));
         CUDA_CHECK(cudaMemcpy(d_sh_coeffs_, h_sh_coeffs.data(), num * 27 * sizeof(float), cudaMemcpyHostToDevice));
         printf("  Uploading dc_colors: %zu bytes\n", num * 3 * sizeof(float));
@@ -1269,6 +1534,123 @@ bool Rasterizer::render_cuda_to_rgba8_device(
     dim3 p(16, 16);
     dim3 g((width + 15)/16, (height + 15)/16);
     packToRGBA8<<<g, p>>>(d_output_, out_rgba8_device, width, height);
+
+    return true;
+}
+
+bool Rasterizer::render_cuda_to_rgba8_device_v2(
+    const glm::mat4& view,
+    const glm::mat4& proj,
+    const glm::vec3& camera_pos,
+    int width,
+    int height,
+    unsigned char* out_rgba8_device
+) {
+    gs::NvtxRange nvtx_frame("GPU_Preprocess_And_Render");
+
+    if (!gaussians_ptr_) {
+        fprintf(stderr, "Error: Scene data not uploaded. Call uploadSceneData() first.\n");
+        return false;
+    }
+    if (!d_pos_ws_ || !d_scale_ || !d_rotation_ || !d_opacity_scene_) {
+        fprintf(stderr, "Error: Missing scene buffers (pos/scale/rotation/opacity).\n");
+        return false;
+    }
+
+    int num_splats = static_cast<int>(scene_num_splats_);
+    if (num_splats <= 0) {
+        fprintf(stderr, "Error: No scene splats uploaded.\n");
+        return false;
+    }
+
+    if (!ensureFrameBuffers(num_splats, width, height)) return false;
+
+    // 1) Preprocess on GPU: project + ellipse params
+    {
+        gs::NvtxRange nvtx_pre("GPU_Preprocess_Kernel");
+        Mat4f v = toMat4f(view);
+        Mat4f p = toMat4f(proj);
+        dim3 block(256);
+        dim3 grid((num_splats + 255) / 256);
+        preprocessKernel<<<grid, block>>>(
+            d_pos_ws_,
+            d_scale_,
+            d_rotation_,
+            d_opacity_scene_,
+            num_splats,
+            v,
+            p,
+            width,
+            height,
+            d_means2D_,
+            d_conic3D_,
+            d_opacities_,
+            d_radii_px_,
+            d_depths_,
+            d_gaussian_ids_
+        );
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA preprocess launch error: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+    }
+
+    // 2) SH colors on GPU
+    {
+        gs::NvtxRange nvtx_sh("GPU_SH_Eval");
+        dim3 block(256);
+        dim3 grid((num_splats + 255) / 256);
+        evalSHColorKernel<<<grid, block>>>(
+            d_gaussian_ids_,
+            d_pos_ws_,
+            d_dc_colors_,
+            d_sh_coeffs_,
+            camera_pos.x, camera_pos.y, camera_pos.z,
+            num_splats,
+            d_colors_
+        );
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA SH launch error: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+    }
+
+    // 3) Tile binning & sorting (same as v1)
+    int num_tiles_x = (width + 15) / 16;
+    int num_tiles_y = (height + 15) / 16;
+    int num_tiles = num_tiles_x * num_tiles_y;
+    size_t total_duplicates = 0;
+
+    {
+        gs::NvtxRange nvtx_tiles("GPU_Tile_Binning");
+        if (!buildTileBinning(num_splats, num_tiles_x, num_tiles_y, num_tiles, total_duplicates)) {
+            fprintf(stderr, "Tile binning failed (v2 path)\n");
+            return false;
+        }
+    }
+
+    // 4) Render tiles + pack to RGBA8
+    {
+        gs::NvtxRange nvtx_render("GPU_Render_Tiles");
+        dim3 block(16, 16);
+        dim3 grid(num_tiles_x, num_tiles_y);
+        splatKernel<<<grid, block>>>(
+            d_means2D_, d_conic3D_, d_colors_, d_opacities_,
+            d_tile_splat_list_, d_tile_offsets_,
+            num_tiles_x,
+            width, height,
+            d_output_
+        );
+    }
+
+    {
+        gs::NvtxRange nvtx_pack("GPU_Pack_RGBA8");
+        dim3 p(16, 16);
+        dim3 g((width + 15) / 16, (height + 15) / 16);
+        packToRGBA8<<<g, p>>>(d_output_, out_rgba8_device, width, height);
+    }
 
     return true;
 }
