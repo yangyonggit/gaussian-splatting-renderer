@@ -37,6 +37,7 @@
 #include "gs/gl_utils.h"
 #include "gs/profiler.h"
 #include "gs/sh_color.h"
+#include "gs/nvtx_helper.h"
 #include "cpu_rasterizer.h"
 #include "cuda_rasterizer.h"
 
@@ -345,6 +346,8 @@ static void cleanup(GLFWwindow* window, GLResources& resources, CudaRasterizer::
 // ============================================================
 
 int main(int argc, char* argv[]) {
+    gs::NvtxRange nvtx_main("Viewer_Main");
+    
     // Parse command line arguments
     const char* ply_path = nullptr;
     std::string camera_config_path = "cameras.json";  // default
@@ -566,6 +569,8 @@ bool loadAndPrepareScene(
     std::vector<gs::GaussianSplat>& splats,
     std::vector<gs::ScreenSplat>& screen_splats
 ) {
+    gs::NvtxRange nvtx_scene("Load_And_Prepare_Scene");
+    
     std::cout << "\n🚀 Preparing CUDA renderer..." << std::endl;
 
     glm::mat4 view = buildProvidedViewMatrix();
@@ -619,6 +624,7 @@ void mainLoop(
         );
 
         {
+            gs::NvtxRange nvtx_reproject("CPU_Reproject_Splats");
             glm::mat4 view = camera.getViewMatrix();
             float aspect = static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT);
             glm::mat4 proj = camera.getProjMatrix(aspect);
@@ -630,41 +636,51 @@ void mainLoop(
         }
 
         {
+            gs::NvtxRange nvtx_cuda_frame("CUDA_Render_Frame");
             ScopedTimer timer("cuda_render_frame");
             cudaGraphicsMapResources(1, &resources.cuda_pbo_resource);
             void* d_ptr = nullptr;
             size_t mapped_size = 0;
             cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, resources.cuda_pbo_resource);
 
-            if (!cuda_rasterizer.render_cuda_to_rgba8_device(
-                    screen_splats, camera.getPosition(),
-                    WINDOW_WIDTH, WINDOW_HEIGHT,
-                    reinterpret_cast<unsigned char*>(d_ptr))) {
-                std::cerr << "CUDA rendering (PBO) failed" << std::endl;
-                cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
-                break;
+            {
+                gs::NvtxRange nvtx_render_call("Render_CUDA_To_PBO");
+                if (!cuda_rasterizer.render_cuda_to_rgba8_device(
+                        screen_splats, camera.getPosition(),
+                        WINDOW_WIDTH, WINDOW_HEIGHT,
+                        reinterpret_cast<unsigned char*>(d_ptr))) {
+                    std::cerr << "CUDA rendering (PBO) failed" << std::endl;
+                    cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
+                    break;
+                }
             }
 
             cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
 
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
-            resources.render_target.bind(0);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
-                            GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            {
+                gs::NvtxRange nvtx_texupload("Update_Texture_From_PBO");
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
+                resources.render_target.bind(0);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
+                                GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            }
         }
 
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        {
+            gs::NvtxRange nvtx_gl_display("OpenGL_Display_Frame");
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
 
-        resources.render_target.bind(0);
-        GLint tex_loc = glGetUniformLocation(resources.program, "tex");
-        glUniform1i(tex_loc, 0);
+            resources.render_target.bind(0);
+            GLint tex_loc = glGetUniformLocation(resources.program, "tex");
+            glUniform1i(tex_loc, 0);
 
-        resources.quad.draw();
+            resources.quad.draw();
 
-        glfwSwapBuffers(window);
+            glfwSwapBuffers(window);
+        }
         glfwPollEvents();
 
         frame_count++;

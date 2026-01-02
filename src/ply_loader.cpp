@@ -1,4 +1,5 @@
 #include "gs/ply_loader.h"
+#include "gs/timer.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -10,6 +11,7 @@
 namespace gs {
 
 std::vector<GaussianSplat> loadGaussianPly(const std::string& filename) {
+    Timer totalTimer("PLY load total");
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "Failed to open PLY file: " << filename << std::endl;
@@ -23,31 +25,34 @@ std::vector<GaussianSplat> loadGaussianPly(const std::string& filename) {
     int propertyCount = 0;
     bool isBinaryLittleEndian = false;
 
-    while (std::getline(file, line)) {
-        size_t first = line.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) continue;
-        line.erase(0, first);
-        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+    {
+        Timer headerTimer("PLY header parse");
+        while (std::getline(file, line)) {
+            size_t first = line.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) continue;
+            line.erase(0, first);
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
 
-        std::istringstream iss(line);
-        std::string keyword;
-        iss >> keyword;
+            std::istringstream iss(line);
+            std::string keyword;
+            iss >> keyword;
 
-        if (keyword == "format") {
-            std::string format;
-            iss >> format;
-            if (format == "binary_little_endian") isBinaryLittleEndian = true;
-        } else if (keyword == "element") {
-            std::string type;
-            int count;
-            iss >> type >> count;
-            if (type == "vertex") vertexCount = count;
-        } else if (keyword == "property") {
-            std::string type, name;
-            iss >> type >> name;
-            propIndex[name] = propertyCount++;
-        } else if (keyword == "end_header") {
-            break;
+            if (keyword == "format") {
+                std::string format;
+                iss >> format;
+                if (format == "binary_little_endian") isBinaryLittleEndian = true;
+            } else if (keyword == "element") {
+                std::string type;
+                int count;
+                iss >> type >> count;
+                if (type == "vertex") vertexCount = count;
+            } else if (keyword == "property") {
+                std::string type, name;
+                iss >> type >> name;
+                propIndex[name] = propertyCount++;
+            } else if (keyword == "end_header") {
+                break;
+            }
         }
     }
 
@@ -98,14 +103,28 @@ std::vector<GaussianSplat> loadGaussianPly(const std::string& filename) {
     // ============================================================
     std::vector<GaussianSplat> splats;
     splats.reserve(vertexCount);
-    std::vector<float> row(propertyCount);
+
+    const size_t floatsPerVertex = static_cast<size_t>(propertyCount);
+    const size_t totalFloats = static_cast<size_t>(vertexCount) * floatsPerVertex;
+    std::vector<float> allRows(totalFloats);
     
     // Constant for SH conversion
     const float SH_C0 = 0.28209479177387814f;
 
-    for (int i = 0; i < vertexCount; ++i) {
-        file.read(reinterpret_cast<char*>(row.data()), propertyCount * sizeof(float));
-        if (!file) break;
+    {
+        Timer readTimer("PLY vertex data read");
+        file.read(reinterpret_cast<char*>(allRows.data()), static_cast<std::streamsize>(totalFloats * sizeof(float)));
+    }
+
+    if (!file) {
+        std::cerr << "Failed while reading PLY vertex data: " << filename << std::endl;
+        return {};
+    }
+
+    {
+        Timer parseTimer("PLY vertex data parse");
+        for (int i = 0; i < vertexCount; ++i) {
+            const float* row = allRows.data() + static_cast<size_t>(i) * floatsPerVertex;
 
         GaussianSplat splat;
 
@@ -175,7 +194,8 @@ std::vector<GaussianSplat> loadGaussianPly(const std::string& filename) {
             }
         }
         
-        splats.push_back(splat);
+            splats.push_back(splat);
+        }
     }
 
     return splats;

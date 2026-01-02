@@ -3,6 +3,7 @@
 #include "gs/screen_splat.h"
 #include "gs/sh_color.h"
 #include "gs/profiler.h"
+#include "gs/nvtx_helper.h"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
@@ -684,22 +685,15 @@ bool Rasterizer::debugValidateTileOffsets(int num_tiles, size_t total_duplicates
 }
 
 bool Rasterizer::buildTileBinning(int num_splats, int num_tiles_x, int num_tiles_y, int num_tiles, size_t& total_duplicates) {
+    gs::NvtxRange nvtx_range("Build_Tile_Binning");
+    
     dim3 block256(256);
     dim3 grid256((num_splats + 255) / 256);
 
     // Ensure per-splat buffers exist (duplicates capacity will be resized after total_duplicates is known)
     if (!ensureSortBuffers(num_splats, 1)) return false;
 
-    // Phase 1: tile touch counts
-    computeTileTouchCountKernel<<<grid256, block256>>>(
-        d_means2D_, d_radii_px_, num_splats, num_tiles_x, num_tiles_y, d_num_tiles_touched_);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
-
-    // Phase 2: exclusive scan for duplicate offsets
-    size_t scan_temp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
-
+    // Define the CUB temp buffer allocation helper (used across multiple phases)
     auto ensureCubTemp = [&](size_t bytes) -> bool {
         if (bytes > cub_temp_bytes_) {
             if (d_cub_temp_) cudaFree(d_cub_temp_);
@@ -713,16 +707,35 @@ bool Rasterizer::buildTileBinning(int num_splats, int num_tiles_x, int num_tiles
         return true;
     };
 
-    if (!ensureCubTemp(scan_temp_bytes)) return false;
-    cub::DeviceScan::ExclusiveSum(d_cub_temp_, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    // Phase 1: tile touch counts
+    {
+        gs::NvtxRange nvtx_phase1("Compute_Tile_Touch_Count");
+        computeTileTouchCountKernel<<<grid256, block256>>>(
+            d_means2D_, d_radii_px_, num_splats, num_tiles_x, num_tiles_y, d_num_tiles_touched_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
+
+    // Phase 2: exclusive scan for duplicate offsets
+    {
+        gs::NvtxRange nvtx_phase2("Exclusive_Scan_Duplicates");
+        size_t scan_temp_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
+
+        if (!ensureCubTemp(scan_temp_bytes)) return false;
+        cub::DeviceScan::ExclusiveSum(d_cub_temp_, scan_temp_bytes, d_num_tiles_touched_, d_dup_offsets_, num_splats);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
 
     // Phase 3: compute total_duplicates safely
     int last_offset = 0;
     int last_count = 0;
-    CUDA_CHECK(cudaMemcpy(&last_offset, d_dup_offsets_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&last_count, d_num_tiles_touched_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    {
+        gs::NvtxRange nvtx_phase3("Compute_Total_Duplicates");
+        CUDA_CHECK(cudaMemcpy(&last_offset, d_dup_offsets_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&last_count, d_num_tiles_touched_ + num_splats - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    }
 
     if (last_offset < 0 || last_count < 0) {
         fprintf(stderr, "Invalid scan results: last_offset=%d, last_count=%d\n", last_offset, last_count);
@@ -759,73 +772,93 @@ bool Rasterizer::buildTileBinning(int num_splats, int num_tiles_x, int num_tiles
     }
 
     // Phase 5: emit duplicate keys/values
-    emitDuplicateKeysKernel<<<grid256, block256>>>(
-        d_means2D_, d_radii_px_, d_depths_, num_splats, num_tiles_x, num_tiles_y,
-        d_dup_offsets_, d_keys_, d_values_);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    {
+        gs::NvtxRange nvtx_phase5("Emit_Duplicate_Keys");
+        emitDuplicateKeysKernel<<<grid256, block256>>>(
+            d_means2D_, d_radii_px_, d_depths_, num_splats, num_tiles_x, num_tiles_y,
+            d_dup_offsets_, d_keys_, d_values_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
 
     // Phase 6: radix sort (tile_id primary, depth secondary)
-    size_t sort_temp_bytes = 0;
-    cub::DeviceRadixSort::SortPairs(nullptr, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
-    if (!ensureCubTemp(sort_temp_bytes)) return false;
-    cub::DeviceRadixSort::SortPairs(d_cub_temp_, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    {
+        gs::NvtxRange nvtx_phase6("Radix_Sort_Keys");
+        size_t sort_temp_bytes = 0;
+        cub::DeviceRadixSort::SortPairs(nullptr, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
+        if (!ensureCubTemp(sort_temp_bytes)) return false;
+        cub::DeviceRadixSort::SortPairs(d_cub_temp_, sort_temp_bytes, d_keys_, d_keys_sorted_, d_values_, d_values_sorted_, total_duplicates);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
 
     // Phase 7: extract tile ids for RLE
-    dim3 gridDup((static_cast<int>(total_duplicates) + 255) / 256);
-    extractTileIdsKernel<<<gridDup, block256>>>(d_keys_sorted_, d_tile_ids_sorted_, static_cast<int>(total_duplicates));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    {
+        gs::NvtxRange nvtx_phase7("Extract_Tile_IDs");
+        dim3 gridDup((static_cast<int>(total_duplicates) + 255) / 256);
+        extractTileIdsKernel<<<gridDup, block256>>>(d_keys_sorted_, d_tile_ids_sorted_, static_cast<int>(total_duplicates));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
 
     // Phase 8: run-length encode tile ids
-    size_t rle_temp_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
-        d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
-    if (!ensureCubTemp(rle_temp_bytes)) return false;
-    cub::DeviceRunLengthEncode::Encode(d_cub_temp_, rle_temp_bytes,
-        d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
-
     int h_num_runs = 0;
-    CUDA_CHECK(cudaMemcpy(&h_num_runs, d_num_runs_device_, sizeof(int), cudaMemcpyDeviceToHost));
-    if (h_num_runs <= 0) {
-        fprintf(stderr, "Run-length encode produced zero runs while total_duplicates=%zu\n", total_duplicates);
-        return false;
+    {
+        gs::NvtxRange nvtx_phase8("RLE_Tile_IDs");
+        size_t rle_temp_bytes = 0;
+        cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
+            d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
+        if (!ensureCubTemp(rle_temp_bytes)) return false;
+        cub::DeviceRunLengthEncode::Encode(d_cub_temp_, rle_temp_bytes,
+            d_tile_ids_sorted_, d_unique_tile_ids_, d_run_lengths_, d_num_runs_device_, static_cast<int>(total_duplicates));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+
+        CUDA_CHECK(cudaMemcpy(&h_num_runs, d_num_runs_device_, sizeof(int), cudaMemcpyDeviceToHost));
+        if (h_num_runs <= 0) {
+            fprintf(stderr, "Run-length encode produced zero runs while total_duplicates=%zu\n", total_duplicates);
+            return false;
+        }
     }
 
     // Phase 9: exclusive scan of run lengths -> run offsets
-    size_t run_scan_temp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(nullptr, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
-    if (!ensureCubTemp(run_scan_temp_bytes)) return false;
-    cub::DeviceScan::ExclusiveSum(d_cub_temp_, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    {
+        gs::NvtxRange nvtx_phase9("Scan_Run_Offsets");
+        size_t run_scan_temp_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
+        if (!ensureCubTemp(run_scan_temp_bytes)) return false;
+        cub::DeviceScan::ExclusiveSum(d_cub_temp_, run_scan_temp_bytes, d_run_lengths_, d_run_offsets_, h_num_runs);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
+    }
 
     // Phase 10: scatter run offsets into tile_offsets
-    CUDA_CHECK(cudaMemset(d_tile_offsets_, 0xFF, (num_tiles + 1) * sizeof(int))); // set to -1
-    dim3 gridRuns((h_num_runs + 255) / 256);
-    scatterTileOffsetsKernel<<<gridRuns, block256>>>(d_unique_tile_ids_, d_run_offsets_, h_num_runs, d_tile_offsets_);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+    {
+        gs::NvtxRange nvtx_phase10("Scatter_Tile_Offsets");
+        CUDA_CHECK(cudaMemset(d_tile_offsets_, 0xFF, (num_tiles + 1) * sizeof(int))); // set to -1
+        dim3 gridRuns((h_num_runs + 255) / 256);
+        scatterTileOffsetsKernel<<<gridRuns, block256>>>(d_unique_tile_ids_, d_run_offsets_, h_num_runs, d_tile_offsets_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
 
-    setTileOffsetsTailKernel<<<1, 1>>>(d_tile_offsets_, num_tiles, static_cast<int>(total_duplicates));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+        setTileOffsetsTailKernel<<<1, 1>>>(d_tile_offsets_, num_tiles, static_cast<int>(total_duplicates));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
 
-    fillTileOffsetGapsKernel<<<1, 1>>>(d_tile_offsets_, num_tiles);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_DEBUG_SYNC();
+        fillTileOffsetGapsKernel<<<1, 1>>>(d_tile_offsets_, num_tiles);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_DEBUG_SYNC();
 
-    // Copy sorted splat indices into tile_splat_list
-    CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, d_values_sorted_, total_duplicates * sizeof(int), cudaMemcpyDeviceToDevice));
+        // Copy sorted splat indices into tile_splat_list
+        CUDA_CHECK(cudaMemcpy(d_tile_splat_list_, d_values_sorted_, total_duplicates * sizeof(int), cudaMemcpyDeviceToDevice));
+    }
 
     return debugValidateTileOffsets(num_tiles, total_duplicates);
 }
 
 bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians) {
+    gs::NvtxRange nvtx_range("Upload_Scene_Data");
+    
     int num = static_cast<int>(gaussians.size());
     if (num == 0) {
         fprintf(stderr, "Error: No gaussians to upload\n");
@@ -887,12 +920,15 @@ bool Rasterizer::uploadSceneData(const std::vector<gs::GaussianSplat>& gaussians
     }
 
     // Upload to device
-    printf("  Uploading pos_ws: %zu bytes\n", num * 3 * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_pos_ws_, h_pos_ws.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
-    printf("  Uploading sh_coeffs: %zu bytes\n", num * 27 * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_sh_coeffs_, h_sh_coeffs.data(), num * 27 * sizeof(float), cudaMemcpyHostToDevice));
-    printf("  Uploading dc_colors: %zu bytes\n", num * 3 * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_dc_colors_, h_dc_colors.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    {
+        gs::NvtxRange nvtx_h2d("Upload_Scene_H2D");
+        printf("  Uploading pos_ws: %zu bytes\n", num * 3 * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_pos_ws_, h_pos_ws.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        printf("  Uploading sh_coeffs: %zu bytes\n", num * 27 * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_sh_coeffs_, h_sh_coeffs.data(), num * 27 * sizeof(float), cudaMemcpyHostToDevice));
+        printf("  Uploading dc_colors: %zu bytes\n", num * 3 * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_dc_colors_, h_dc_colors.data(), num * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    }
 
     scene_num_splats_ = num;
     printf("✅ Scene data uploaded: %d gaussians\n  Pointers: pos_ws=%p, sh_coeffs=%p, dc_colors=%p\n", 
@@ -907,6 +943,8 @@ bool Rasterizer::render_cuda(
     int height,
     float* output_image
 ) {
+    gs::NvtxRange nvtx_render("Render_CUDA");
+    
     int num_splats = static_cast<int>(screen_splats.size());
     
     if (num_splats == 0) {
@@ -1008,6 +1046,7 @@ bool Rasterizer::render_cuda(
 
     // Launch GPU SH evaluation kernel
     {
+        gs::NvtxRange nvtx_sh("Eval_SH_Color");
         ScopedTimer timer("gpu_sh_eval", &t_sh_ms);
         dim3 block(256);
         dim3 grid((num_splats + 255) / 256);
@@ -1051,6 +1090,7 @@ bool Rasterizer::render_cuda(
     size_t total_duplicates = 0;
 
     {
+        gs::NvtxRange nvtx_tile("GPU_Tile_Binning_Sort");
         ScopedTimer timer("gpu_tile_binning_sort", &t_tile_ms);
         if (!buildTileBinning(num_splats, num_tiles_x, num_tiles_y, num_tiles, total_duplicates)) {
             fprintf(stderr, "Tile binning failed\n");
@@ -1070,10 +1110,12 @@ bool Rasterizer::render_cuda(
            grid.x, grid.y, block.x, block.y);
     fflush(stdout);
 
-    CudaTimer kernel_timer("raster_kernel", &gpu_total_ms);
-    kernel_timer.start();
+    {
+        gs::NvtxRange nvtx_splat("Splat_Kernel");
+        CudaTimer kernel_timer("raster_kernel", &gpu_total_ms);
+        kernel_timer.start();
 
-    splatKernel<<<grid, block>>>(
+        splatKernel<<<grid, block>>>(
         d_means2D_,
         d_conic3D_,
         d_colors_,
@@ -1092,15 +1134,17 @@ bool Rasterizer::render_cuda(
         return false;
     }
 
-    // No explicit sync; host copy will synchronize
-    {
-        ScopedTimer timer("download_d2h", &t_d2h_ms);
-        CUDA_CHECK(cudaMemcpy(output_image, d_output_, 
-                             width * height * 3 * sizeof(float), cudaMemcpyDeviceToHost));
-    }
+        // No explicit sync; host copy will synchronize
+        {
+            gs::NvtxRange nvtx_d2h("Download_Output_D2H");
+            ScopedTimer timer("download_d2h", &t_d2h_ms);
+            CUDA_CHECK(cudaMemcpy(output_image, d_output_, 
+                                 width * height * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+        }
 
-    // Stop timer after copy (implies kernel completion)
-    kernel_timer.stop();
+        // Stop timer after copy (implies kernel completion)
+        kernel_timer.stop();
+    }
 
 #if ENABLE_PROFILING
     double cpu_total_ms = t_sh_ms + t_tile_ms + t_h2d_ms + t_d2h_ms;
