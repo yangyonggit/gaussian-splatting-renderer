@@ -312,8 +312,8 @@ void main() {
 
 struct GLResources {
     GLuint program = 0;
-    GLuint pbo = 0;
-    cudaGraphicsResource* cuda_pbo_resource = nullptr;
+    GLuint pbo[2] = {0, 0};
+    cudaGraphicsResource* cuda_pbo_resource[2] = {nullptr, nullptr};
     gs::gl::FullscreenQuad quad;
     gs::gl::Texture render_target;
 };
@@ -548,16 +548,18 @@ bool createGLResources(GLResources& resources) {
         return false;
     }
 
-    glGenBuffers(1, &resources.pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, WINDOW_WIDTH * WINDOW_HEIGHT * 4, nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glGenBuffers(2, resources.pbo);
+    for (int i = 0; i < 2; ++i) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, WINDOW_WIDTH * WINDOW_HEIGHT * 4, nullptr, GL_DYNAMIC_DRAW);
 
-    if (cudaGraphicsGLRegisterBuffer(&resources.cuda_pbo_resource, resources.pbo, 
-                                     cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
-        std::cerr << "Failed to register PBO with CUDA" << std::endl;
-        return false;
+        if (cudaGraphicsGLRegisterBuffer(&resources.cuda_pbo_resource[i], resources.pbo[i],
+                                         cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
+            std::cerr << "Failed to register PBO[" << i << "] with CUDA" << std::endl;
+            return false;
+        }
     }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     std::cout << "✅ GL resources created" << std::endl;
     return true;
@@ -606,6 +608,7 @@ void mainLoop(
     std::cout << "\n▶️  Entering main loop..." << std::endl;
     double last_time = glfwGetTime();
     int frame_count = 0;
+    uint64_t frame_index = 0;
 
     while (!glfwWindowShouldClose(window)) {
         double current_time = glfwGetTime();
@@ -632,36 +635,58 @@ void mainLoop(
         glm::mat4 proj = camera.getProjMatrix(aspect);
 
         {
-            gs::NvtxRange nvtx_cuda_frame("CUDA_Render_Frame_V2");
+            gs::NvtxRange nvtx_cuda_frame("CUDA_GL_Interop_DoublePBO");
             ScopedTimer timer("cuda_render_frame");
-            cudaGraphicsMapResources(1, &resources.cuda_pbo_resource);
-            void* d_ptr = nullptr;
-            size_t mapped_size = 0;
-            cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, resources.cuda_pbo_resource);
 
+            const int current = static_cast<int>(frame_index & 1ull);
+            const int next = static_cast<int>((frame_index + 1ull) & 1ull);
+
+            // 1) GPU side: map next PBO and render into it (no explicit device sync)
             {
-                gs::NvtxRange nvtx_render_call("Render_CUDA_To_PBO_V2");
+                gs::NvtxRange nvtx_gpu("CUDA_Render_To_PBO_Next");
+                cudaError_t err = cudaGraphicsMapResources(1, &resources.cuda_pbo_resource[next]);
+                if (err != cudaSuccess) {
+                    std::cerr << "cudaGraphicsMapResources failed: " << cudaGetErrorString(err) << std::endl;
+                    break;
+                }
+
+                void* d_ptr = nullptr;
+                size_t mapped_size = 0;
+                err = cudaGraphicsResourceGetMappedPointer(&d_ptr, &mapped_size, resources.cuda_pbo_resource[next]);
+                if (err != cudaSuccess || !d_ptr) {
+                    std::cerr << "cudaGraphicsResourceGetMappedPointer failed: " << cudaGetErrorString(err) << std::endl;
+                    cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource[next]);
+                    break;
+                }
+
                 if (!cuda_rasterizer.render_cuda_to_rgba8_device_v2(
                         view, proj, camera.getPosition(),
                         WINDOW_WIDTH, WINDOW_HEIGHT,
                         reinterpret_cast<unsigned char*>(d_ptr))) {
                     std::cerr << "CUDA rendering (PBO) failed" << std::endl;
-                    cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
+                    cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource[next]);
+                    break;
+                }
+
+                // 2) OpenGL side: upload previous frame from current PBO while CUDA works on next
+                if (frame_index > 0) {
+                    gs::NvtxRange nvtx_upload("OpenGL_Upload_CurrentPBO");
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo[current]);
+                    resources.render_target.bind(0);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
+                                    GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                }
+
+                // Release CUDA ownership so OpenGL can read this PBO next frame
+                err = cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource[next]);
+                if (err != cudaSuccess) {
+                    std::cerr << "cudaGraphicsUnmapResources failed: " << cudaGetErrorString(err) << std::endl;
                     break;
                 }
             }
 
-            cudaGraphicsUnmapResources(1, &resources.cuda_pbo_resource);
-
-            {
-                gs::NvtxRange nvtx_texupload("Update_Texture_From_PBO");
-                glBindTexture(GL_TEXTURE_2D, 0);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, resources.pbo);
-                resources.render_target.bind(0);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
-                                GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            }
+            frame_index++;
         }
 
         {
@@ -694,8 +719,11 @@ void cleanup(GLFWwindow* window, GLResources& resources, CudaRasterizer::Rasteri
     std::cout << "\n🧹 Cleaning up..." << std::endl;
     resources.quad.cleanup();
     resources.render_target.cleanup();
-    if (resources.cuda_pbo_resource) cudaGraphicsUnregisterResource(resources.cuda_pbo_resource);
-    if (resources.pbo) glDeleteBuffers(1, &resources.pbo);
+    for (int i = 0; i < 2; ++i) {
+        if (resources.cuda_pbo_resource[i]) cudaGraphicsUnregisterResource(resources.cuda_pbo_resource[i]);
+        resources.cuda_pbo_resource[i] = nullptr;
+    }
+    glDeleteBuffers(2, resources.pbo);
     if (resources.program) glDeleteProgram(resources.program);
     cuda_rasterizer.free();
     glfwDestroyWindow(window);

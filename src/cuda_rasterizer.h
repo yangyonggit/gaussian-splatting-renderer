@@ -123,6 +123,7 @@ private:
     int* d_run_lengths_ = nullptr;           // [num_runs] run lengths from RLE
     int* d_run_offsets_ = nullptr;           // [num_runs] exclusive scan of run lengths
     int* d_num_runs_device_ = nullptr;       // single int on device holding num_runs
+    int* d_total_duplicates_device_ = nullptr; // single int on device holding computed valid duplicates
     void* d_cub_temp_ = nullptr;             // CUB temporary storage
     size_t sort_buffer_capacity_ = 0;        // capacity for sort arrays
     size_t run_buffer_capacity_ = 0;         // capacity for RLE buffers (>= total_dup)

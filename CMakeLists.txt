@@ -6,6 +6,15 @@ set(CMAKE_TOOLCHAIN_FILE "" CACHE FILEPATH "CMake toolchain file" FORCE)
 # Define the project name and version
 project(MiniGSRenderer VERSION 1.0 LANGUAGES CXX CUDA)
 
+# ----------------------------------------------------------
+# Build options (speed up iterative builds)
+# ----------------------------------------------------------
+# User request: disable the apps backed by src/main.cpp (MiniGSRenderer)
+# and src/viewer_progressive.cpp by default to avoid wasting build time.
+option(BUILD_MINIGSRENDERER "Build MiniGSRenderer (src/main.cpp)" OFF)
+option(BUILD_VIEWER_MAIN "Build viewer_main (interactive viewer)" ON)
+option(BUILD_VIEWER_PROGRESSIVE "Build viewer_progressive" OFF)
+
 # Set C++ Standard to C++17 (Required for modern features)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -113,8 +122,10 @@ list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/viewer_progressive.cpp")
 # Exclude legacy STB impl TU to avoid duplicate symbol definitions
 list(REMOVE_ITEM CPP_SOURCES "${CMAKE_SOURCE_DIR}/src/stb_image_write_impl.cpp")
 
-# Create the executable target
-add_executable(MiniGSRenderer ${CPP_SOURCES} ${CUDA_SOURCES})
+# Create the executable target (optional)
+if(BUILD_MINIGSRENDERER)
+    add_executable(MiniGSRenderer ${CPP_SOURCES} ${CUDA_SOURCES})
+endif()
 
 # ----------------------------------------------------------
 # 3. Linking & Includes
@@ -123,26 +134,27 @@ add_executable(MiniGSRenderer ${CPP_SOURCES} ${CUDA_SOURCES})
 # Find CUDA Toolkit (required for cudaMemcpy, cudaMalloc, etc.)
 find_package(CUDAToolkit REQUIRED)
 
-# Link GLM
-# GLM provides a modern CMake target "glm::glm" that handles include paths automatically.
-target_link_libraries(MiniGSRenderer PRIVATE glm::glm)
+if(TARGET MiniGSRenderer)
+    # Link GLM
+    # GLM provides a modern CMake target "glm::glm" that handles include paths automatically.
+    target_link_libraries(MiniGSRenderer PRIVATE glm::glm)
 
-# Link nlohmann_json (header-only target)
-target_link_libraries(MiniGSRenderer PRIVATE nlohmann_json::nlohmann_json)
+    # Link nlohmann_json (header-only target)
+    target_link_libraries(MiniGSRenderer PRIVATE nlohmann_json::nlohmann_json)
 
-# Link CUDA runtime
-target_link_libraries(MiniGSRenderer PRIVATE CUDA::cudart)
+    # Link CUDA runtime
+    target_link_libraries(MiniGSRenderer PRIVATE CUDA::cudart)
 
-# Include STB directory
-# STB is a header-only library without a CMake target, so we manually add the include path.
-# ${stb_SOURCE_DIR} is automatically defined by FetchContent.
-target_include_directories(MiniGSRenderer PRIVATE ${stb_SOURCE_DIR})
+    # Include STB directory
+    # STB is a header-only library without a CMake target, so we manually add the include path.
+    # ${stb_SOURCE_DIR} is automatically defined by FetchContent.
+    target_include_directories(MiniGSRenderer PRIVATE ${stb_SOURCE_DIR})
 
-
-target_include_directories(MiniGSRenderer
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-)
+    target_include_directories(MiniGSRenderer
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+    )
+endif()
 
 # ----------------------------------------------------------
 # 4. Viewer Target (Stage A - Interactive Viewer)
@@ -150,76 +162,104 @@ target_include_directories(MiniGSRenderer
 message(STATUS "🎮 Building viewer target...")
 
 # Viewer executable with vendored GLAD (no network required)
-add_executable(viewer_main 
-    src/viewer_main.cpp 
-    src/cuda_rasterizer.cu 
-    src/cpu_rasterizer.cpp 
-    src/ellipse.cpp 
-    src/ply_loader.cpp 
-    src/sh_color.cpp
-)
+if(BUILD_VIEWER_MAIN)
+    add_executable(viewer_main 
+        src/viewer_main.cpp 
+        src/cuda_rasterizer.cu 
+        src/cpu_rasterizer.cpp 
+        src/ellipse.cpp 
+        src/ply_loader.cpp 
+        src/sh_color.cpp
+    )
 
-target_link_libraries(viewer_main PRIVATE
-    glm::glm
-    glfw
-    glad              # Vendored GLAD static library
-    CUDA::cudart
-    nlohmann_json::nlohmann_json
-)
+    target_link_libraries(viewer_main PRIVATE
+        glm::glm
+        glfw
+        glad              # Vendored GLAD static library
+        CUDA::cudart
+        nlohmann_json::nlohmann_json
+    )
 
-target_include_directories(viewer_main 
-    PRIVATE 
-    ${CMAKE_SOURCE_DIR}/include
-)
+    target_include_directories(viewer_main 
+        PRIVATE 
+        ${CMAKE_SOURCE_DIR}/include
+    )
+endif()
 
 # ----------------------------------------------------------
 # 4b. Viewer Target (Progressive reveal viewer)
 # ----------------------------------------------------------
 message(STATUS "🎮 Building progressive viewer target...")
 
-add_executable(viewer_progressive
-    src/viewer_progressive.cpp
-    src/cuda_rasterizer.cu
-    src/cpu_rasterizer.cpp
-    src/ellipse.cpp
-    src/ply_loader.cpp
-    src/sh_color.cpp
-)
+if(BUILD_VIEWER_PROGRESSIVE)
+    add_executable(viewer_progressive
+        src/viewer_progressive.cpp
+        src/cuda_rasterizer.cu
+        src/cpu_rasterizer.cpp
+        src/ellipse.cpp
+        src/ply_loader.cpp
+        src/sh_color.cpp
+    )
 
-target_link_libraries(viewer_progressive PRIVATE
-    glm::glm
-    glfw
-    glad
-    CUDA::cudart
-    nlohmann_json::nlohmann_json
-)
+    target_link_libraries(viewer_progressive PRIVATE
+        glm::glm
+        glfw
+        glad
+        CUDA::cudart
+        nlohmann_json::nlohmann_json
+    )
 
-target_include_directories(viewer_progressive
-    PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-)
+    target_include_directories(viewer_progressive
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+endif()
 
-# Put both executables in the same directory
-set_target_properties(viewer_main viewer_progressive MiniGSRenderer PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
-)
+set(_runtime_targets "")
+if(TARGET viewer_main)
+    list(APPEND _runtime_targets viewer_main)
+endif()
+if(TARGET viewer_progressive)
+    list(APPEND _runtime_targets viewer_progressive)
+endif()
+if(TARGET MiniGSRenderer)
+    list(APPEND _runtime_targets MiniGSRenderer)
+endif()
+if(_runtime_targets)
+    # Put enabled executables in the same directory
+    set_target_properties(${_runtime_targets} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+endif()
 
 # Enable image writing only for the CLI target
-target_compile_definitions(MiniGSRenderer PRIVATE GS_ENABLE_IMAGE_WRITE=1)
+if(TARGET MiniGSRenderer)
+    target_compile_definitions(MiniGSRenderer PRIVATE GS_ENABLE_IMAGE_WRITE=1)
+endif()
 
 message(STATUS "✅ Viewer target configured")
 
 # Use UTF-8 source encoding on MSVC to silence C4819 warnings
 # Apply correctly per language to avoid passing `/utf-8` raw to NVCC
 if(MSVC)
-    target_compile_options(MiniGSRenderer PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
-    )
-    target_compile_options(viewer_main PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
-    )
+    if(TARGET MiniGSRenderer)
+        target_compile_options(MiniGSRenderer PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
+        )
+    endif()
+    if(TARGET viewer_main)
+        target_compile_options(viewer_main PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
+        )
+    endif()
+    if(TARGET viewer_progressive)
+        target_compile_options(viewer_progressive PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/utf-8">
+        )
+    endif()
 endif()
 
 message(STATUS "✅ Setup Complete! Ready to build.")
